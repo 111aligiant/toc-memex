@@ -5,7 +5,7 @@ __pycache__/
 .env
 data/
 eval/
-tests/fixtures/
+tests/fixtures/*
 !tests/fixtures/README.md
 logs/
 *.db
