@@ -3,6 +3,9 @@ name = "toc-memex"
 version = "0.1.0"
 description = "Toc Memex: a local-first AI memory over your documents (OCR + TOC + BM25)"
 requires-python = ">=3.12,<3.13"
+authors = [{ name = "111aligiant", email = "302075143+111aligiant@users.noreply.github.com" }]
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "aiosqlite>=0.20.0",
@@ -36,7 +39,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

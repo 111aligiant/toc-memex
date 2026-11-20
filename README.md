@@ -183,3 +183,10 @@ default suite.
   users.
 - OCR cache and downloaded resources live under `TOCMEMEX_DATA_DIR`; back up the SQLite
   file and that directory together. `scripts/backup.py` does this transactionally.
+
+## License
+
+Toc Memex is released under the **MIT License**; see [`LICENSE`](LICENSE).
+
+Third-party code keeps its own license — in particular `vendor/pageindex/` is
+MIT-licensed (Vectify AI) and is not relicensed.

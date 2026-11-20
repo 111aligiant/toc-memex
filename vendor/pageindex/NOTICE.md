@@ -5,6 +5,9 @@
 - License: MIT (see `LICENSE` in this directory)
 - Copyright: Vectify AI
 
+This directory is third-party code, not authored by the Toc Memex project.
+It remains MIT-licensed under the notice above.
+
 Vendored files:
 
 - `utils.py`
