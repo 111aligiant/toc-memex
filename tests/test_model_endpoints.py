@@ -221,3 +221,59 @@ async def test_active_endpoint_env_fallback_carries_effort(session):
     got = await active_endpoint(session, _settings(tocmemex_llm_reasoning_effort="medium"))
     assert got["base_url"] == "http://env/v1"
     assert got["reasoning_effort"] == "medium"
+
+
+# ── EndpointIn base_url validation (S1) ──
+
+
+def test_endpoint_in_rejects_non_http_scheme():
+    """A stored LLM endpoint must not be an ftp://, file:// or bare scheme."""
+    from pydantic import ValidationError
+
+    from app.web_api import EndpointIn
+
+    for bad in ("ftp://evil/v1", "file:///etc/passwd", "gopher://evil/v1"):
+        with pytest.raises(ValidationError):
+            EndpointIn(name="x", base_url=bad, model="m")
+
+
+def test_endpoint_in_rejects_missing_host():
+    from pydantic import ValidationError
+
+    from app.web_api import EndpointIn
+
+    with pytest.raises(ValidationError):
+        EndpointIn(name="x", base_url="http:///v1", model="m")
+
+
+def test_endpoint_in_rejects_embedded_credentials():
+    """Credentials in the URL would leak the (already-stored) key to a
+    third host; the write path must refuse them like OcrEndpointIn does."""
+    from pydantic import ValidationError
+
+    from app.web_api import EndpointIn
+
+    with pytest.raises(ValidationError):
+        EndpointIn(name="x", base_url="http://user:pass@evil/v1", model="m")
+
+
+def test_endpoint_in_accepts_valid_url():
+    from app.web_api import EndpointIn
+
+    body = EndpointIn(
+        name="x", base_url="https://api.example.com/v1", model="m", api_key="k"
+    )
+    assert body.base_url == "https://api.example.com/v1"
+
+
+def test_endpoint_in_matches_ocr_validator():
+    """The two write bodies must agree on what a valid base_url is."""
+    from pydantic import ValidationError
+
+    from app.web_api import EndpointIn, OcrEndpointIn
+
+    bad = "http://user:pass@evil/v1"
+    with pytest.raises(ValidationError):
+        EndpointIn(name="x", base_url=bad, model="m")
+    with pytest.raises(ValidationError):
+        OcrEndpointIn(name="x", provider="mistral", base_url=bad, model="")

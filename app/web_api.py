@@ -598,6 +598,22 @@ class IngestNoteIn(BaseModel):
     body: str = Field(default="", max_length=20000)
 
 
+def _validate_endpoint_base_url(value: str) -> str:
+    """Shared base_url check for LLM and OCR endpoint write bodies.
+
+    Rejects non-http(s) schemes, URLs without a host, and URLs that embed
+    credentials (which would leak into logs and outbound requests).
+    """
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("base_url must be an http(s) URL")
+    if not (parsed.hostname or "").strip():
+        raise ValueError("base_url must include a host")
+    if parsed.username or parsed.password:
+        raise ValueError("base_url must not embed credentials")
+    return value
+
+
 class EndpointIn(BaseModel):
     """Body for POST/PUT /api/endpoints. api_key empty means "keep the
     stored one" on PUT; the plaintext is stored, never echoed back.
@@ -609,6 +625,19 @@ class EndpointIn(BaseModel):
     model: str = Field(min_length=1, max_length=120)
     reasoning_effort: str = Field(default="", max_length=20)
     enabled: bool = True
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        """Reject malformed or credential-bearing URLs at write time.
+
+        Without this, a stored LLM endpoint could be pointed at an arbitrary
+        host, turning the next chat/run call into an SSRF probe that also
+        ships the stored API key to that host. Mirrors
+        ``OcrEndpointIn._check_base_url``; the outbound guard still runs per
+        request, this only blocks obviously wrong input from being stored.
+        """
+        return _validate_endpoint_base_url(value)
 
 
 class OcrEndpointIn(BaseModel):
@@ -631,14 +660,7 @@ class OcrEndpointIn(BaseModel):
         this only stops obviously wrong input from being stored, where it
         would otherwise fail on the next ingest instead of in the UI.
         """
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"}:
-            raise ValueError("base_url must be an http(s) URL")
-        if not (parsed.hostname or "").strip():
-            raise ValueError("base_url must include a host")
-        if parsed.username or parsed.password:
-            raise ValueError("base_url must not embed credentials")
-        return value
+        return _validate_endpoint_base_url(value)
 
 
 class BenchIn(BaseModel):
