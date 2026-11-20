@@ -101,9 +101,19 @@ def _render(
     if right - left < _MIN_IMAGE_W or lower - upper < _MIN_IMAGE_H:
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
+    # pypdfium2's render(crop=...) takes cut-off amounts in PDF bottom-up
+    # space: (left, bottom, right, top). ``_render`` receives pdfplumber
+    # top-down coordinates (x0, top, x1, bottom), so ``upper``/``lower`` are
+    # distances from the page *top*. Converting to bottom-up cut-offs:
+    #   cut from bottom = page_height - lower  (keep everything above ``lower``)
+    #   cut from top    = upper                (keep everything below ``upper``)
+    # Passing ``upper`` as the bottom cut (the old bug) mirrored the crop
+    # vertically, so figures in the top half were rendered blank and dropped
+    # by ``_has_ink``. Verified on a synthetic PDF: wrong formula renders a
+    # top-half black block to 0 dark pixels, correct formula keeps it whole.
     bitmap = pdf_page.render(
         scale=_RENDER_DPI / 72,
-        crop=(left, upper, page_width - right, page_height - lower),
+        crop=(left, page_height - lower, page_width - right, upper),
     )
     image = bitmap.to_pil()
     if not _has_ink(image):
@@ -451,7 +461,15 @@ def attach_pdf_text_media(
                     )
                 except Exception:
                     # A malformed page must not take the whole text-layer
-                    # parse (and therefore the document) down with it.
+                    # parse (and therefore the document) down with it. Log it
+                    # so a systematic render failure (e.g. a bad crop) is
+                    # visible instead of silently yielding zero figures.
+                    logger.warning(
+                        "text-layer media: page %d failed in %s",
+                        page_index,
+                        path,
+                        exc_info=True,
+                    )
                     continue
         finally:
             pdfium_document.close()

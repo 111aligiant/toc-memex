@@ -82,3 +82,74 @@ def test_text_layer_pdf_gets_tables_figures_and_captions(tmp_path):
     table_lines = [line for line in text.splitlines() if line.startswith("|")]
     assert table_lines
     assert len({line.count("|") for line in table_lines}) == 1
+
+
+def _dark_pixels(image: Image.Image) -> int:
+    return sum(image.convert("L").histogram()[:128])
+
+
+def _block_pdf(path: Path, block_top: float, block_bottom: float) -> None:
+    """One black rectangle spanning the full width at the given top-down y."""
+    sheet = canvas.Canvas(str(path), pagesize=(595, 842))
+    sheet.setFillColorRGB(0, 0, 0)
+    # reportlab draws bottom-up; convert top-down y to PostScript y.
+    height = block_bottom - block_top
+    sheet.rect(60, 842 - block_bottom, 475, height, fill=1, stroke=0)
+    sheet.showPage()
+    sheet.save()
+
+
+def test_render_crop_keeps_top_half_block(tmp_path):
+    """Regression for the vertically mirrored crop (B1).
+
+    The crop is passed to pypdfium2 in bottom-up cut-off space; the old code
+    used pdfplumber top-down values, which rendered a top-half figure blank
+    (0 dark pixels) so ``_has_ink`` dropped it. The correct crop must keep
+    the block. This distinguishes the two formulas: the old one produced 0
+    dark pixels, the fixed one keeps the whole block.
+    """
+    import pypdfium2 as pdfium
+
+    from app.ingest.pdf_media import _render
+
+    pdf_path = tmp_path / "top.pdf"
+    _block_pdf(pdf_path, block_top=50, block_bottom=150)
+    output = tmp_path / "top.jpg"
+
+    document = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = document[0]
+        # pdfplumber top-down rect (x0, top, x1, bottom) around the block.
+        kept = _render(page, 595, 842, (60, 50, 535, 150), output)
+    finally:
+        document.close()
+
+    assert kept is True
+    with Image.open(output) as image:
+        dark = _dark_pixels(image)
+    # The old (mirrored) formula rendered this to ~0 dark pixels; the correct
+    # one keeps the full black block. Assert well above the blank threshold.
+    assert dark > 5000, f"top-half block was cropped away (dark_px={dark})"
+
+
+def test_render_crop_keeps_bottom_half_block(tmp_path):
+    """The symmetric case: a bottom-half block must also survive the crop."""
+    import pypdfium2 as pdfium
+
+    from app.ingest.pdf_media import _render
+
+    pdf_path = tmp_path / "bottom.pdf"
+    _block_pdf(pdf_path, block_top=692, block_bottom=792)
+    output = tmp_path / "bottom.jpg"
+
+    document = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = document[0]
+        kept = _render(page, 595, 842, (60, 692, 535, 792), output)
+    finally:
+        document.close()
+
+    assert kept is True
+    with Image.open(output) as image:
+        dark = _dark_pixels(image)
+    assert dark > 5000, f"bottom-half block was cropped away (dark_px={dark})"
