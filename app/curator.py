@@ -1,0 +1,420 @@
+"""``python -m app.curator`` — run the curator, inspect proposals, report.
+
+    python -m app.curator run --once [--limit 10] [--agent|--no-agent]
+    python -m app.curator run --every 360          # periodic maintenance loop
+    python -m app.curator report
+    python -m app.curator proposals [--doc ID] [--verdict pending]
+    python -m app.curator audit                    # undo snapshots still present?
+    python -m app.curator repair-snapshots         # backfill legacy snapshots
+    python -m app.curator undo [--proposal ID]     # default: newest applied
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+
+from sqlalchemy import select
+
+from .config import get_settings
+from .curation import runner
+from .curation import lock as runner_lock
+from .curation.outcomes import strategy_report
+from .db import init_db, make_engine, session_factory
+from .ingest.pipeline import set_engine
+from .models import CurationProposal
+
+
+def _print_run(result: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    mode = "agent" if result.get("agent") else "rules"
+    print(
+        f"run {result['run_id']}: {len(result['documents'])} document(s), "
+        f"mode {mode}"
+    )
+    for doc in result["documents"]:
+        applied = sum(job.get("applied", 0) for job in doc["jobs"])
+        print(f"  {doc['title'][:40]:42} applied {applied}")
+        for job in doc["jobs"]:
+            state = job.get("skipped") or job.get("error") or (
+                f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
+            )
+            print(f"    {job.get('kind', '?'):16} {state}")
+    print(f"total applied ops: {result['applied']}; skipped: {result['skipped']}")
+    if result.get("timed_out"):
+        print("达到墙钟预算，已提前结束；剩余文档留待下一轮。")
+
+
+async def _run(args) -> int:
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    use_agent = True if args.agent else (False if args.no_agent else None)
+    if args.once:
+        interval = 0.0
+    elif args.every is not None:
+        interval = max(0.0, float(args.every))
+    else:
+        # No flag: use the 编修 interval only when the user actually saved
+        # settings (stored row). The shipped default is a UI suggestion, not
+        # a reason to turn a one-shot `curator run` into a daemon.
+        from sqlalchemy import select as _select
+
+        from .models import AgentSetting
+
+        async with session_factory(engine)() as db:
+            row = (
+                await db.execute(
+                    _select(AgentSetting).where(AgentSetting.name == "bianxiu")
+                )
+            ).scalar_one_or_none()
+        stored = (row.config if row else {}) or {}
+        interval = max(0.0, float(stored.get("interval") or 0)) * 60
+    try:
+        while True:
+            async with session_factory(engine)() as db:
+                await runner.recover_stale_jobs(db)
+                try:
+                    result = await runner.run_once(
+                        db,
+                        settings.tocmemex_data_dir,
+                        limit=args.limit,
+                        max_chunk_chars=settings.tocmemex_max_chunk_chars,
+                        use_agent=use_agent,
+                        wall_clock_minutes=args.wall_clock,
+                    )
+                except runner_lock.CuratorBusy as exc:
+                    print(f"skipped: {exc}")
+                    if not interval:
+                        return 3
+                    result = None
+            if result is not None:
+                _print_run(result, args.json)
+            if not interval:
+                return 0
+            # Periodic maintenance: the loop is the scheduler. Each pass
+            # takes the same single-instance lock, so a manual run and a
+            # scheduled one never overlap.
+            try:
+                await asyncio.sleep(interval * 60)
+            except asyncio.CancelledError:
+                raise
+    except KeyboardInterrupt:
+        print("stopped")
+        return 0
+    finally:
+        await engine.dispose()
+
+
+async def _undo(args) -> int:
+    """Restore the pre-write state recorded for one proposal."""
+    from sqlalchemy import select as _select
+
+    from .curation.undo import undo_proposal
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            if not args.proposal:
+                # The common human request is "undo the last thing the
+                # curator did", which has no proposal id in hand.
+                rows = (
+                    (
+                        await db.execute(
+                            _select(CurationProposal)
+                            .where(CurationProposal.applied_ops > 0)
+                            .order_by(CurationProposal.created_at.desc())
+                            .limit(1)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not rows:
+                    print("no applied proposal to undo")
+                    return 1
+                args.proposal = rows[0].id
+            try:
+                result = await undo_proposal(
+                    db, settings.tocmemex_data_dir, args.proposal
+                )
+            except (LookupError, ValueError) as exc:
+                await db.rollback()
+                print(str(exc))
+                return 1
+            await db.commit()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            mode = "精确快照" if result["stepwise"] else "回退到 adoption 基线"
+            print(
+                f"undid proposal {result['proposal_id'][:8]} "
+                f"({mode}): {result['restored']['nodes']} nodes / "
+                f"{result['restored']['chunks']} chunks"
+            )
+            if not result["stepwise"]:
+                print(
+                    "注意：该提案没有快照（早于快照功能），整份文档已回到"
+                    "curator 介入前的基线。"
+                )
+        return 0
+    finally:
+        await engine.dispose()
+
+
+async def _repair_snapshots(args) -> int:
+    """Copy adoption baselines into snapshots for legacy applied proposals."""
+    from .curation.undo import backfill_snapshots
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            result = await backfill_snapshots(db, dry_run=args.dry_run)
+            if not args.dry_run:
+                await db.commit()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        await engine.dispose()
+
+
+async def _audit(args) -> int:
+    """Check that every applied proposal still has an undoable pre-write state."""
+    from .curation.snapshots import CurationSnapshot
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            applied = (
+                (
+                    await db.execute(
+                        select(CurationProposal)
+                        .where(CurationProposal.applied_ops > 0)
+                        .order_by(CurationProposal.created_at)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            recorded = set(
+                (
+                    await db.execute(
+                        select(CurationSnapshot.proposal_id).distinct()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        missing = [row for row in applied if row.id not in recorded]
+        payload = {
+            "applied_proposals": len(applied),
+            "with_snapshot": len(applied) - len(missing),
+            "missing_snapshot": len(missing),
+            "missing": [
+                {
+                    "proposal_id": row.id,
+                    "strategy": row.strategy,
+                    "applied_ops": row.applied_ops,
+                    "created_at": row.created_at,
+                }
+                for row in missing[:50]
+            ],
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(
+                f"applied proposals: {payload['applied_proposals']}; "
+                f"with snapshot: {payload['with_snapshot']}; "
+                f"missing: {payload['missing_snapshot']}"
+            )
+            if missing:
+                print(
+                    "缺少快照的改动只能回退到 adoption 基线（整份文档），"
+                    "不能逐次撤销："
+                )
+                for row in missing[:10]:
+                    print(
+                        f"  {row.id[:8]}  {row.strategy:14} "
+                        f"applied={row.applied_ops}  {row.created_at}"
+                    )
+        return 0 if not missing else 1
+    finally:
+        await engine.dispose()
+
+
+async def _report(args) -> int:
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            rows = await strategy_report(db)
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        if not rows:
+            print("no outcomes yet; run `python -m app.curator run --once`")
+            return 0
+        print(f"{'策略':<18}{'应用':>6}{'更好':>6}{'更差':>6}{'持平':>6}  平均 delta")
+        for row in rows:
+            delta = ", ".join(f"{key} {value:+}" for key, value in row["delta"].items()) or "-"
+            print(
+                f"{row['strategy']:<18}{row['applied']:>6}{row['better']:>6}"
+                f"{row['worse']:>6}{row['neutral']:>6}  {delta}"
+            )
+        return 0
+    finally:
+        await engine.dispose()
+
+
+async def _proposals(args) -> int:
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            stmt = select(CurationProposal).order_by(CurationProposal.created_at.desc())
+            if args.doc:
+                from .models import CurationJob
+
+                job_ids = (
+                    (
+                        await db.execute(
+                            select(CurationJob.id).where(CurationJob.doc_id == args.doc)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                stmt = stmt.where(CurationProposal.job_id.in_(job_ids))
+            if args.verdict:
+                stmt = stmt.where(CurationProposal.verdict == args.verdict)
+            rows = (await db.execute(stmt.limit(args.limit))).scalars().all()
+        if args.json:
+            print(
+                json.dumps(
+                    [
+                        {
+                            "id": row.id,
+                            "job_id": row.job_id,
+                            "strategy": row.strategy,
+                            "verdict": row.verdict,
+                            "applied_ops": row.applied_ops,
+                            "dropped_ops": row.dropped_ops,
+                            "rationale": row.rationale,
+                            "created_at": row.created_at,
+                        }
+                        for row in rows
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        for row in rows:
+            print(
+                f"{row.id[:8]}  {row.strategy:14} {row.verdict:9} "
+                f"applied={row.applied_ops} dropped={row.dropped_ops}  {row.created_at}"
+            )
+        print(f"{len(rows)} proposal(s)")
+        return 0
+    finally:
+        await engine.dispose()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="curator")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="run one curator pass")
+    run.add_argument("--once", action="store_true", help="run a single pass and exit")
+    run.add_argument(
+        "--every",
+        type=float,
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "keep running, sleeping this many minutes between passes; "
+            "omit to use the 编修 interval from settings (hours → minutes)"
+        ),
+    )
+    run.add_argument("--limit", type=int, default=runner.DEFAULT_DOC_LIMIT)
+    agent_group = run.add_mutually_exclusive_group()
+    agent_group.add_argument(
+        "--agent",
+        action="store_true",
+        help="force the LLM agent loop (falls back to rules if no endpoint)",
+    )
+    agent_group.add_argument(
+        "--no-agent",
+        action="store_true",
+        help="force the deterministic rules even when an LLM endpoint is configured",
+    )
+    run.add_argument(
+        "--wall-clock",
+        type=float,
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "stop gracefully after this many minutes; omit to use the 编修 "
+            f"settings (default {runner.DEFAULT_WALL_CLOCK_MINUTES})"
+        ),
+    )
+    run.add_argument("--json", action="store_true")
+
+    report = sub.add_parser("report", help="strategy outcomes")
+    report.add_argument("--json", action="store_true")
+
+    proposals = sub.add_parser("proposals", help="list proposals")
+    proposals.add_argument("--doc", default=None)
+    proposals.add_argument("--verdict", default=None)
+    proposals.add_argument("--limit", type=int, default=50)
+    proposals.add_argument("--json", action="store_true")
+
+    undo = sub.add_parser(
+        "undo", help="undo one applied proposal (default: the newest)"
+    )
+    undo.add_argument("--proposal", default=None)
+    undo.add_argument("--json", action="store_true")
+
+    audit = sub.add_parser(
+        "audit", help="check that applied proposals still have undo snapshots"
+    )
+    audit.add_argument("--json", action="store_true")
+
+    repair = sub.add_parser(
+        "repair-snapshots",
+        help="give legacy applied proposals a snapshot from their adoption baseline",
+    )
+    repair.add_argument("--dry-run", action="store_true")
+
+    args = parser.parse_args(argv)
+    handlers = {
+        "run": _run,
+        "report": _report,
+        "proposals": _proposals,
+        "undo": _undo,
+        "audit": _audit,
+        "repair-snapshots": _repair_snapshots,
+    }
+    return asyncio.run(handlers[args.command](args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

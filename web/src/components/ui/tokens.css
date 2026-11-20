@@ -1,0 +1,65 @@
+/* ── UI 基础层 tokens ─────────────────────────────────────────
+ * 只补充现有 main.css 缺的部分，不改动已有变量。
+ * 动效曲线与控件尺寸参考 magpie（MIT, yetone/magpie）的做法：
+ * 控件读作“弹出按钮”，而不是描边的表单元素。
+ *
+ * 注意：本文件由 main.js 全局引入。组件依赖这些变量，
+ * 任何一处漏引都会让圆角/动效/底色失效。
+ * ──────────────────────────────────────────────────────────── */
+
+:root {
+  /* 动效：magpie 的两条主曲线，短交互用 --ease，进出场用 --ease-out */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --ease-out: cubic-bezier(.23, 1, .32, 1);
+
+  /* 控件高度：三档，全局统一，杜绝 26/27/28/30 混用 */
+  --ctl-h-sm: 24px;
+  --ctl-h: 28px;
+  --ctl-h-lg: 32px;
+
+  /* 控件圆角：magpie 的 6/7px，比现有 --radius-sm 略大一点，更“按钮” */
+  --ctl-radius: 7px;
+
+  /* 输入类控件的聚焦光环：跟着边框一起出现，不参与布局 */
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+
+  /* 静默表面上的控件底：比 surface 深一档，hover 再深一档 */
+  --pill: var(--surface-2);
+  --pill-hover: var(--surface-3);
+  --pill-line: color-mix(in srgb, var(--border) 70%, transparent);
+
+  /* 分段开关：轨道比滑块深一档，滑块才浮得起来。
+     两者必须来自不同变量，否则暗色下会撞成同一个颜色。 */
+  --seg-track: var(--surface-3);
+  --seg-thumb: var(--surface);
+  --seg-thumb-edge: 0 1px 2px rgba(20, 22, 30, .14), 0 0 0 .5px rgba(20, 22, 30, .08);
+}
+
+[data-theme="dark"] {
+  --pill: var(--surface-3);
+  --pill-hover: color-mix(in srgb, var(--surface-3) 72%, #fff 8%);
+  --pill-line: color-mix(in srgb, var(--border) 90%, transparent);
+
+  --seg-track: rgba(255, 255, 255, .04);
+  --seg-thumb: rgba(255, 255, 255, .14);
+  --seg-thumb-edge: inset 0 .5px 0 rgba(255, 255, 255, .08), 0 1px 2px rgba(0, 0, 0, .3);
+}
+
+/* 所有 ui 组件共用的重置与焦点行为。
+   焦点统一成 outline：键盘可见、不参与布局、不会和 border 打架。 */
+.ui-btn,
+.ui-chip,
+.ui-seg,
+.ui-input,
+.ui-note {
+  font-family: inherit;
+  -webkit-font-smoothing: antialiased;
+}
+
+.ui-btn:focus-visible,
+.ui-chip:focus-visible,
+.ui-seg button:focus-visible,
+.ui-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
