@@ -280,10 +280,15 @@ async def get_printed_toc_llm(
     from ..config import get_settings
     from ..ingest.llm_toc import detect_printed_toc_llm
     from ..ingest.reindex import load_parsed
+    from ..llm.purpose import resolve_runtime
 
     doc = await _document(db, doc_id)
-    settings = get_settings()
-    if not settings.tocmemex_llm_api_key or not settings.tocmemex_llm_model:
+    # Same resolution ingest uses: 纲目's endpoint → DB default endpoint →
+    # .env. Checking only ``Settings()`` made this tool report "LLM is not
+    # configured" while ingest was happily calling the endpoint stored in
+    # the database.
+    settings, _endpoint, _cfg = await resolve_runtime(db, "gangmu", get_settings())
+    if settings is None:
         return {
             "doc_id": doc_id,
             "available": False,

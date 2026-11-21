@@ -7,7 +7,7 @@ from app.curation import llm_log
 from app.curation import ops as ops_mod
 from app.curation.dispatch import Dispatcher
 from app.db import init_db, make_engine, session_factory
-from app.models import AgentNote, Chunk, Document, Namespace, TocNode
+from app.models import AgentNote, Chunk, Document, ModelEndpoint, Namespace, TocNode
 
 
 # ── §10.4: since filter ─────────────────────────────────────────────────
@@ -208,6 +208,51 @@ async def test_printed_toc_tool_reports_unavailable_without_llm(tmp_path, monkey
         assert result["available"] is False
         assert result["entries"] == []
         assert "budget" in result
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_printed_toc_tool_uses_the_db_endpoint(tmp_path, monkeypatch):
+    """Ingest resolves the DB default endpoint; the tool must see it too.
+
+    Regression: the tool checked only ``Settings()`` (.env), so it reported
+    "LLM is not configured" while ingest was calling the endpoint stored in
+    ``model_endpoints``.
+    """
+    from app.config import get_settings
+    from app.ingest import llm_toc, reindex
+
+    monkeypatch.setenv("TOCMEMEX_LLM_API_KEY", "")
+    monkeypatch.setenv("TOCMEMEX_LLM_MODEL", "")
+    get_settings.cache_clear()
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        db.add(
+            ModelEndpoint(
+                name="magpie",
+                base_url="http://127.0.0.1:9/v1",
+                api_key="db-key",
+                model="db-model",
+                enabled=True,
+                is_default=True,
+            )
+        )
+        await db.commit()
+
+        seen: dict[str, str] = {}
+        monkeypatch.setattr(reindex, "load_parsed", lambda doc, settings: object())
+
+        def fake_detect(parsed, settings, doc_id="", **kwargs):
+            seen["api_key"] = settings.tocmemex_llm_api_key
+            seen["model"] = settings.tocmemex_llm_model
+            return None
+
+        monkeypatch.setattr(llm_toc, "detect_printed_toc_llm", fake_detect)
+        dispatcher = Dispatcher(db, tmp_path, "d1")
+        result = await dispatcher.dispatch("get_printed_toc_llm", {})
+        assert result["available"] is True
+        assert seen == {"api_key": "db-key", "model": "db-model"}
+    get_settings.cache_clear()
     await engine.dispose()
 
 
