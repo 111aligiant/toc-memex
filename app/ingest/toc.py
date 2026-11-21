@@ -392,11 +392,27 @@ def _nodes_from_printed_entries(
     def sibling_key(index: int) -> tuple:
         entry = entries[index]
         return (
-            entry.page_index if entry.page_index is not None else 10**9,
             keys[index] or (9999,),
             0 if entry.is_master else 1,
             entry.order,
         )
+
+    def sort_siblings(indexes: list[int]) -> list[int]:
+        """Reading order, unless the numbers contradict it.
+
+        A printed TOC lists siblings in numeric order, and front matter
+        (前言/摘要) sits before chapter 1 — reading order encodes both. But a
+        two-column TOC read out of order (or one wrong page mapping) breaks
+        that monotonicity; then the heading numbers are the only trustworthy
+        order and the group is re-sorted by them.
+        """
+        numbered = [keys[i] for i in indexes if keys[i] is not None]
+        monotonic = all(
+            right >= left for left, right in zip(numbered, numbered[1:])
+        )
+        if numbered and not monotonic:
+            return sorted(indexes, key=sibling_key)
+        return sorted(indexes, key=lambda i: entries[i].order)
 
     nodes: list[TocNodeData] = []
 
@@ -423,10 +439,10 @@ def _nodes_from_printed_entries(
                 confidence=min(confidence, entry.confidence),
             )
         )
-        for child in sorted(children.get(index, []), key=sibling_key):
+        for child in sort_siblings(children.get(index, [])):
             walk(child, node_id, path, depth + 1)
 
-    for root in sorted(roots, key=sibling_key):
+    for root in sort_siblings(roots):
         walk(root, None, "", 1)
 
     return nodes
@@ -793,7 +809,12 @@ def _build_toc_channels(
             # unhealthy AND bookmarks can actually beat it.
             issues = validate_toc(nodes, parsed.page_count)
             has_errors = any(issue.severity == "error" for issue in issues)
-            if roots < 3 or unordered or has_errors:
+            # A rule tree much smaller than the filtered outline is suspect
+            # too: mangled text layers turn TOC blobs into a handful of junk
+            # roots that still look "ordered", while the authored outline
+            # holds the real tree.
+            outline_richer = len(bookmarks) >= 3 and len(nodes) < len(bookmarks) // 2
+            if roots < 3 or unordered or has_errors or outline_richer:
                 if trace is not None:
                     trace["llm_used"] = True
                     trace["llm_model"] = settings.tocmemex_llm_model
@@ -817,8 +838,9 @@ def _build_toc_channels(
                 trace["llm_outcome"] = "not_needed"
         elif trace is not None:
             trace["llm_outcome"] = "unavailable"
+        outline_richer = len(bookmarks) >= 3 and len(nodes) < len(bookmarks) // 2
         weak = roots < 3 and len(bookmarks) >= 3
-        if not (weak or (unordered and len(bookmarks) >= 3)):
+        if not (weak or (unordered and len(bookmarks) >= 3) or outline_richer):
             _trace_channel(trace, "printed_toc")
             return nodes
 

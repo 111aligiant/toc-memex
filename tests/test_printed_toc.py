@@ -788,3 +788,131 @@ def test_phantom_bookmark_outside_its_chapter_is_dropped():
     assert all(
         node.page_start is None or node.page_start <= 3 for node in nodes
     )
+
+
+# ── TOC continuation pages (marker-less spill-over) ────────────────────
+
+
+def test_toc_continuation_page_without_marker_is_collected():
+    from app.ingest.printed_toc import _collect_toc_pages
+
+    pages = [
+        page(
+            0,
+            text("目录", 100),
+            text("1 甲 ..... 1", 200),
+            text("2 乙 ..... 2", 240),
+            text("3 丙 ..... 3", 280),
+        ),
+        page(
+            1,
+            text("４．１ 实验过程＃３９", 100),
+            text("４．２ 燃烧气氛对前驱体的影响＃４０", 140),
+            text("４．３ 碳热还原反应过程＃４４", 180),
+        ),
+    ] + [page(i, text(f"第{i}页 正文内容，句子以句号结束。", 100)) for i in range(2, 12)]
+
+    collected = _collect_toc_pages(pages)
+    indices = {page_index for page_index, _ in collected}
+    assert 0 in indices and 1 in indices
+    continuation = dict(collected)[1]
+    assert [entry.heading_num for entry in continuation] == ["4.1", "4.2", "4.3"]
+    # The broken layer keeps fullwidth digits; _printed_key normalizes them.
+    assert [_printed_key(entry.printed_page) for entry in continuation] == [
+        "n:39",
+        "n:40",
+        "n:44",
+    ]
+
+
+def test_body_page_after_toc_is_not_a_continuation():
+    from app.ingest.printed_toc import _collect_toc_pages
+
+    pages = [
+        page(
+            0,
+            text("目录", 100),
+            text("1 甲 ..... 1", 200),
+            text("2 乙 ..... 2", 240),
+            text("3 丙 ..... 3", 280),
+        ),
+        page(
+            1,
+            text("1 实验表明样品在1300℃下保温2h后完全氮化，见文献。", 100),
+            text("2 结果与讨论部分的其余内容照常排版，不以页码结尾。", 140),
+        ),
+    ] + [page(i, text(f"第{i}页 正文。", 100)) for i in range(2, 12)]
+
+    indices = {page_index for page_index, _ in _collect_toc_pages(pages)}
+    assert 1 not in indices
+
+
+# ── body-line artifacts sharing a heading number ───────────────────────
+
+
+def test_dedupe_drops_body_line_that_shares_a_heading_number():
+    entries = [
+        TocEntry(
+            title="2.2 低压化学气相沉积设备简介",
+            heading_num="2.2",
+            level=2,
+            printed_page="17",
+            page_index=None,
+            confidence=0.9,
+            order=0,
+        ),
+        TocEntry(
+            title="2.2 所示。它是在低压条件下运行由芯片控制的全自动设备主要由腔室构成",
+            heading_num="2.2",
+            level=2,
+            printed_page=None,
+            page_index=None,
+            confidence=0.8,
+            order=1,
+        ),
+    ]
+    kept = _dedupe_entries(entries)
+    assert [entry.title for entry in kept] == ["2.2 低压化学气相沉积设备简介"]
+
+
+def test_dedupe_keeps_two_real_sections_with_the_same_number_shape():
+    """Different real titles under one number are both kept (计时器/测量尺)."""
+    entries = [
+        TocEntry(
+            title="6.3 计时器",
+            heading_num="6.3",
+            level=2,
+            printed_page="12",
+            page_index=None,
+            confidence=0.9,
+            order=0,
+        ),
+        TocEntry(
+            title="6.3 测量尺",
+            heading_num="6.3",
+            level=2,
+            printed_page="13",
+            page_index=None,
+            confidence=0.9,
+            order=1,
+        ),
+    ]
+    assert len(_dedupe_entries(entries)) == 2
+
+
+# ── reading order beats resolved pages for siblings ────────────────────
+
+
+def test_printed_nodes_follow_reading_order_not_resolved_pages():
+    from app.ingest.toc import _nodes_from_printed_entries
+
+    entries = [
+        TocEntry("1 绪论", "1", 1, "1", 11, 0.9, order=0),
+        TocEntry("1.1 引言", "1.1", 2, "1", 11, 0.9, order=1),
+        TocEntry("1.2 压电效应", "1.2", 2, "2", 12, 0.9, order=2),
+        # 1.3's page mapping is wrong (same page as 1.1); reading order wins.
+        TocEntry("1.3 研究现状", "1.3", 2, "2", 11, 0.9, order=3),
+    ]
+    nodes = _nodes_from_printed_entries("d1", entries, 30, 0.9)
+    children = [node.title for node in nodes if node.level == 2]
+    assert children == ["1.1 引言", "1.2 压电效应", "1.3 研究现状"]

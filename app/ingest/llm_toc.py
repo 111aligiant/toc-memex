@@ -537,7 +537,6 @@ def detect_printed_toc_llm(
         _dedupe_entries,
         _map_entries,
         _normalize_title,
-        heading_sort_key,
         toc_page_indices as rule_toc_page_indices,
     )
 
@@ -625,15 +624,13 @@ def detect_printed_toc_llm(
 
         seen: set[tuple[str, int]] = set()
         unique: list[TocEntry] = []
-        for entry in sorted(
-            mapped,
-            key=lambda e: (
-                e.page_index or 0,
-                heading_sort_key(e.heading_num),
-                0 if e.is_master else 1,
-                e.order,
-            ),
-        ):
+        # ``mapped`` keeps the LLM's reading order (the order the printed TOC
+        # lists the entries in). Renumber and sort by it: sorting by resolved
+        # page puts unmapped entries first via ``page_index or 0`` and lets
+        # one wrong mapping scramble whole sibling groups.
+        for position, entry in enumerate(mapped):
+            entry.order = position
+        for entry in sorted(mapped, key=lambda e: e.order):
             key = (_normalize_title(entry.title), entry.page_index or 0)
             if key in seen:
                 continue

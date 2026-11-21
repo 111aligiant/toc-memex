@@ -38,6 +38,12 @@ _TOC_LINE_CHAPTER = re.compile(
     re.IGNORECASE,
 )
 _PAGE_NUM = re.compile(rf"^(?:{_PAGE_TOKEN})$")
+# Trailing printed-page label on a TOC continuation line, where the leader
+# has degraded to "#", stray dots or just spaces. Fullwidth digits included:
+# broken text layers often switch digit width mid-document.
+_TRAILING_PAGE_LABEL = re.compile(
+    r"(?:[\s#＃.。·…．]{1,}|\s{2,})(?P<page>[0-9０-９]+|[ivxIVX]+)\s*$"
+)
 _DASH_TRANS = str.maketrans(
     {"－": "-", "–": "-", "—": "-", "−": "-"}
 )
@@ -214,6 +220,11 @@ def _make_entry(line: str, x0: float, confidence: float) -> TocEntry | None:
     parsed = parse_heading(raw_title) or (None, raw_title, 1)
     num, title, level = parsed
     if not title:
+        return None
+    if not any(char.isalpha() for char in title):
+        # A heading always carries words. Digit-only titles come from merged
+        # TOC blobs ("…＃４０４．５烧结性能＃４３" read as one line) and are
+        # pure noise; keeping them fakes a healthy chapter tree.
         return None
     if num is None:
         # Figure/table captions and body sentences can end with a page-like
@@ -723,6 +734,20 @@ def _same_section(left: TocEntry, right: TocEntry) -> bool:
     return _title_similarity(a, b) >= 0.5
 
 
+def _looks_like_body_line(title: str) -> bool:
+    """A TOC title never ends a sentence or runs half a paragraph.
+
+    Wrapped body text under a heading number ("2.2 所示。它是在低压条件
+    下运行…") is a text-layer artifact, not a second section with the same
+    number; it must lose to the real heading that shares its number.
+    """
+    return bool(title) and (
+        title[-1] in "。？！；，、"
+        or "。" in title
+        or len(title) > 60
+    )
+
+
 def _dedupe_entries(entries: list[TocEntry]) -> list[TocEntry]:
     """Merge near-identical entries that share a heading number.
 
@@ -730,16 +755,32 @@ def _dedupe_entries(entries: list[TocEntry]) -> list[TocEntry]:
     (确认/验证, 范围/适用范围). Keeping both creates duplicate sibling
     numbers and splits one section's content across two nodes. Entries with
     genuinely different titles (e.g. 计时器/测量尺 under the same number)
-    are kept as-is.
+    are kept as-is — unless one of them reads like a wrapped body line, in
+    which case the sentence-shaped one is the artifact and is dropped.
     """
+    # Pass 1: drop body-line artifacts that collide with a real heading on
+    # the same number, regardless of title similarity.
+    by_number: dict[str, list[int]] = {}
+    for index, entry in enumerate(entries):
+        if entry.heading_num:
+            key = re.sub(r"\s+", "", entry.heading_num).lower()
+            by_number.setdefault(key, []).append(index)
+    dropped: set[int] = set()
+    for indexes in by_number.values():
+        if len(indexes) < 2:
+            continue
+        clean = [i for i in indexes if not _looks_like_body_line(entries[i].title)]
+        if clean and len(clean) < len(indexes):
+            dropped.update(i for i in indexes if i not in clean)
+
     kept: list[TocEntry] = []
     used: set[int] = set()
     for index, entry in enumerate(entries):
-        if index in used:
+        if index in used or index in dropped:
             continue
         group = [index]
         for other_index in range(index + 1, len(entries)):
-            if other_index in used:
+            if other_index in used or other_index in dropped:
                 continue
             if _same_section(entry, entries[other_index]):
                 group.append(other_index)
@@ -759,6 +800,55 @@ def _dedupe_entries(entries: list[TocEntry]) -> list[TocEntry]:
     return kept
 
 
+def _continuation_entries(page: OcrPage) -> list[TocEntry]:
+    """Entries for a TOC continuation page the strict parser cannot read.
+
+    A master TOC often runs past the page that carries the "目录" marker.
+    Continuation pages lose the dot leaders (or the text layer mangles
+    them), so ``parse_toc_page`` finds nothing and the rest of the TOC is
+    silently dropped. Accept a line as a continuation entry when it starts
+    with a heading number and ends with a printed page label — the two
+    properties every TOC line has and no body line combines.
+    """
+    entries: list[TocEntry] = []
+    for block in _ordered_blocks(page):
+        for line in block.content.splitlines():
+            raw = line.strip()
+            if not raw or len(raw) > 120:
+                continue
+            parsed = parse_heading(raw)
+            if parsed is None or parsed[0] is None:
+                continue
+            num, title, _ = parsed
+            if not title:
+                continue
+            match = _TRAILING_PAGE_LABEL.search(raw)
+            if match is None:
+                continue
+            printed = match.group("page")
+            if _printed_key(printed) is None:
+                continue
+            # Strip the leader and page label from the title.
+            title = raw[: match.start()].rstrip(" #＃.。·…．-－—–、")
+            stripped = parse_heading(title)
+            if stripped is not None and stripped[1]:
+                num, title = stripped[0] or num, stripped[1]
+            if not title or not any(char.isalpha() for char in title):
+                continue  # digit-only residue of a merged TOC line
+            entries.append(
+                TocEntry(
+                    title=title,
+                    heading_num=num,
+                    level=max(1, min(6, parsed[2])),
+                    printed_page=printed,
+                    page_index=None,
+                    confidence=0.75,
+                    order=len(entries),
+                )
+            )
+    return entries
+
+
 def _collect_toc_pages(
     pages: list[OcrPage],
 ) -> list[tuple[int, list[TocEntry]]]:
@@ -766,13 +856,28 @@ def _collect_toc_pages(
         return []
     early_limit = max(10, int(len(pages) * 0.2))
     toc_pages: list[tuple[int, list[TocEntry]]] = []
+    seen: set[int] = set()
     for page in pages:
         page_entries = parse_toc_page(page)
         if _looks_like_toc_page(
             page, page_entries, require_marker=page.page_index >= early_limit
         ):
             toc_pages.append((page.page_index, page_entries))
-    return toc_pages
+            seen.add(page.page_index)
+    # A master TOC that spills onto the next page usually loses its marker
+    # and its leaders together. Give the page right after a detected TOC page
+    # one relaxed chance: enough numbered-lines-with-page-labels means it is
+    # part of the same TOC, not body text (body sentences end with 。, not a
+    # page number).
+    for page in pages:
+        if page.page_index in seen or page.page_index - 1 not in seen:
+            continue
+        if not _looks_like_toc_page(page, parse_toc_page(page), require_marker=False):
+            entries = _continuation_entries(page)
+            if len(entries) >= 3:
+                toc_pages.append((page.page_index, entries))
+                seen.add(page.page_index)
+    return sorted(toc_pages, key=lambda item: item[0])
 
 
 def toc_page_indices(pages: list[OcrPage]) -> set[int]:
@@ -943,18 +1048,15 @@ def detect_printed_toc(parsed: ParsedDocument) -> PrintedToc | None:
 
     seen: set[tuple[str, int]] = set()
     unique: list[TocEntry] = []
-    for entry in sorted(
-        mapped,
-        key=lambda e: (
-            e.page_index or 0,
-            # Sort by heading number, not by the master flag: entries sharing a
-            # page (e.g. chapter 26 and appendices A-C all start on page 290)
-            # must stay in numeric order so children follow their own parent.
-            heading_sort_key(e.heading_num),
-            0 if e.is_master else 1,
-            e.order,
-        ),
-    ):
+    # ``merged`` lists masters, then chapter TOCs, then outline children —
+    # each group already in reading order. Renumber ``order`` sequentially so
+    # it is the global reading order and sort by it: sorting by resolved page
+    # scrambles the tree whenever one page mapping is off (a section jumps
+    # ahead of an earlier sibling that was mapped to the same page, and an
+    # unmapped entry lands in front of everything via ``page_index or 0``).
+    for position, entry in enumerate(mapped):
+        entry.order = position
+    for entry in sorted(mapped, key=lambda e: e.order):
         key = (_normalize_title(entry.title), entry.page_index or 0)
         if key in seen:
             continue
