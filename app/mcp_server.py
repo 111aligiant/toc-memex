@@ -1217,6 +1217,20 @@ async def get_quality(doc_id: str = "") -> dict:
 
 
 @server.tool()
+async def list_quality_signals(days: int = 7, limit: int = 20) -> dict:
+    """Library-wide read-only patrol signals.
+
+    Quality issues grouped by kind, zero-hit queries, documents searched but
+    never marked used, proposals waiting for a human, recent automatic
+    rollbacks and errata counts. Use it to find what deserves attention; it
+    changes nothing.
+    """
+    return await _curation_call(
+        "", "list_quality_signals", {"days": days, "limit": limit}
+    )
+
+
+@server.tool()
 async def get_usage(doc_id: str) -> dict:
     """Usage aggregates: queries that surfaced this document, mark_used rate."""
     return await _curation_call(doc_id, "get_usage", {})

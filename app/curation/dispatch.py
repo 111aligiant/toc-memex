@@ -21,6 +21,7 @@ READ_TOOLS = {
     "get_page_text": tools.get_page_text,
     "get_chunks": tools.get_chunks,
     "get_quality": tools.get_quality,
+    "list_quality_signals": tools.list_quality_signals,
     "get_usage": tools.get_usage,
     "get_toc_nodes": tools.get_toc_nodes,
     "get_printed_toc_llm": tools.get_printed_toc_llm,
@@ -327,6 +328,26 @@ def tool_schemas() -> list[dict]:
                 "name": "get_quality",
                 "description": "Quality issues for this document (same enumeration as the quality page).",
                 "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_quality_signals",
+                "description": (
+                    "Library-wide patrol signals, read-only: quality issues "
+                    "grouped by kind, zero-hit queries, documents searched but "
+                    "never marked used, pending proposals, recent automatic "
+                    "rollbacks, errata counts. Use it to name a problem that "
+                    "deserves attention before proposing anything."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "days": {"type": "integer", "default": 7},
+                        "limit": {"type": "integer", "default": 20},
+                    },
+                },
             },
         },
         {

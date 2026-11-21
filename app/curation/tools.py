@@ -207,6 +207,28 @@ async def get_quality(db: AsyncSession, data_dir, doc_id: str = "", **budget) ->
     }
 
 
+async def list_quality_signals(
+    db: AsyncSession,
+    data_dir,
+    doc_id: str = "",
+    days: int = 7,
+    limit: int = 20,
+    **budget,
+) -> dict:
+    """Library-wide patrol signals, read-only (self-evolution §5.4.1).
+
+    Quality issues by kind, zero-hit queries, documents searched but never
+    marked used, proposals waiting for a human, recent automatic rollbacks
+    and errata counts. The agent uses this to name a problem worth a new job
+    kind; it changes nothing.
+    """
+    from .signals import collect_signals
+
+    result = await collect_signals(db, data_dir, days=days, limit=limit)
+    result["budget"] = _budget(budget.get("calls_left"), budget.get("tokens_left"))
+    return result
+
+
 async def get_usage(db: AsyncSession, data_dir, doc_id: str, **budget) -> dict:
     """Usage aggregates for one document: queries, hits, mark_used rate."""
     from sqlalchemy import text as sql_text

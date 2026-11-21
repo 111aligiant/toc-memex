@@ -4,6 +4,7 @@
     python -m app.curator run --every 360          # periodic maintenance loop
     python -m app.curator report
     python -m app.curator replay [--days 7]      # zero-hit search queries, replayed
+    python -m app.curator signals [--days 7]     # read-only patrol report
     python -m app.curator proposals [--doc ID] [--verdict pending]
     python -m app.curator audit                    # undo snapshots still present?
     python -m app.curator repair-snapshots         # backfill legacy snapshots
@@ -453,6 +454,70 @@ async def _replay(args) -> int:
         await engine.dispose()
 
 
+async def _signals(args) -> int:
+    """One read-only patrol report across quality, search and curation."""
+    from .curation.signals import collect_signals
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            payload = await collect_signals(
+                db,
+                settings.tocmemex_data_dir,
+                days=args.days,
+                limit=args.limit,
+            )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        print(f"巡逻信号（近 {payload['window_days']} 天）")
+        issues = payload["quality_issues"]
+        if issues:
+            print("质量告警：")
+            for item in issues:
+                print(
+                    f"  {item['kind']:<18} {item['groups']:>3} 组 / "
+                    f"{item['count']:>4} 项 / {item['documents']:>3} 份文档"
+                )
+        else:
+            print("质量告警：无")
+        misses = payload["zero_hit_queries"]
+        if misses:
+            print("零命中查询：")
+            for item in misses:
+                print(
+                    f"  {item['misses']:>3}× {item['tool']:<6} {item['query'][:60]}"
+                )
+        unused = payload["unused_heat"]
+        if unused:
+            print("检索多但从未标记采用：")
+            for item in unused:
+                print(
+                    f"  {item['searched']:>3} 次 / {item['queries']} 条查询  "
+                    f"{item['title'][:40]}"
+                )
+        print(f"待批提案：{len(payload['pending_proposals'])}")
+        rollbacks = payload["auto_rollbacks"]
+        if rollbacks:
+            print("最近自动回滚：")
+            for item in rollbacks:
+                print(
+                    f"  {item['kind'] or '-'} / {item['strategy'] or '-'}  "
+                    f"{item['title'][:32]}  {item['note']}"
+                )
+        if payload["errata"]:
+            print(
+                "勘误："
+                + "、".join(f"{status} {count}" for status, count in payload["errata"].items())
+            )
+        return 0
+    finally:
+        await engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="curator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -520,6 +585,13 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--top", type=int, default=8)
     replay.add_argument("--json", action="store_true")
 
+    signals = sub.add_parser(
+        "signals", help="read-only patrol report: quality, search, curation signals"
+    )
+    signals.add_argument("--days", type=int, default=7)
+    signals.add_argument("--limit", type=int, default=20)
+    signals.add_argument("--json", action="store_true")
+
     proposals = sub.add_parser("proposals", help="list proposals")
     proposals.add_argument("--doc", default=None)
     proposals.add_argument("--verdict", default=None)
@@ -553,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
         "repair-snapshots": _repair_snapshots,
         "verify": _verify,
         "replay": _replay,
+        "signals": _signals,
     }
     return asyncio.run(handlers[args.command](args))
 
