@@ -6,12 +6,14 @@ pending proposals, automatic rollbacks and errata.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.curation import tools
 from app.curation.signals import collect_signals
 from app.db import init_db, make_engine, session_factory
-from app.index.activity import Erratum, UsageLog, usage_log_write
+from app.index.activity import Erratum, Task, UsageLog, usage_log_write
 from app.models import (
     Chunk,
     CurationJob,
@@ -105,6 +107,18 @@ async def _seed(tmp_path):
                 status="proposed",
             )
         )
+        db.add(
+            Task(
+                id="task-review-1",
+                title="纲目复审：温度试验方法",
+                goal=json.dumps(
+                    {"doc_id": "d1", "node_id": "d1:h:1", "reason": "页码漂移"}
+                ),
+                kind="gangmu-review",
+                status="open",
+                owner_agent="curator",
+            )
+        )
         # Two misses and five hits nobody marked used.
         await usage_log_write(db, "量子纠缠", "search", [])
         await usage_log_write(db, "量子纠缠", "web", [])
@@ -140,6 +154,9 @@ async def test_collect_signals_joins_every_source(tmp_path):
     assert report["unused_heat"][0]["searched"] == 5
     assert report["pending_proposals"][0]["proposal_id"] == "proposal-1"
     assert report["pending_proposals"][0]["doc_title"] == "温度试验方法"
+    assert report["open_review_tasks"][0]["task_id"] == "task-review-1"
+    assert report["open_review_tasks"][0]["doc_title"] == "温度试验方法"
+    assert report["open_review_tasks"][0]["reason"] == "页码漂移"
     assert report["auto_rollbacks"][0]["strategy"] == "rule_merge"
     assert report["errata"] == {"proposed": 1}
     await engine.dispose()

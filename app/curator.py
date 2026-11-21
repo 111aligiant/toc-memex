@@ -522,6 +522,14 @@ async def _signals(args) -> int:
                     f"{_safe(item['title'], 40)}"
                 )
         print(f"待批提案：{len(payload['pending_proposals'])}")
+        review_tasks = payload.get("open_review_tasks") or []
+        if review_tasks:
+            print("待处理纲目工单：")
+            for item in review_tasks:
+                print(
+                    f"  {_safe(item['status'], 8):<8} {_safe(item['doc_title'], 32):<32} "
+                    f"{_safe(item['reason'], 60)}"
+                )
         rollbacks = payload["auto_rollbacks"]
         if rollbacks:
             print("最近自动回滚：")

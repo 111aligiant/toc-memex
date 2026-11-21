@@ -20,6 +20,7 @@ tool all read the same shape.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -219,6 +220,49 @@ async def _recent_rollbacks(db: AsyncSession, days: int, limit: int) -> list[dic
     ]
 
 
+async def _open_review_tasks(db: AsyncSession, limit: int) -> list[dict]:
+    """gangmu-review work orders still open (M3b dispatch chain)."""
+    try:
+        rows = (
+            await db.execute(
+                text(
+                    "SELECT id, title, goal, status, owner_agent, created_at "
+                    "FROM tasks WHERE kind = 'gangmu-review' "
+                    "AND status IN ('open', 'doing') "
+                    "ORDER BY created_at LIMIT :k"
+                ),
+                {"k": max(1, limit)},
+            )
+        ).mappings().all()
+    except Exception:
+        return []
+    doc_ids: list[str] = []
+    parsed: list[tuple[dict, dict]] = []
+    for row in rows:
+        try:
+            goal = json.loads(row["goal"] or "{}")
+        except ValueError:
+            goal = {}
+        parsed.append((dict(row), goal))
+        if goal.get("doc_id"):
+            doc_ids.append(goal["doc_id"])
+    titles = await _titles(db, doc_ids)
+    return [
+        {
+            "task_id": row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "owner_agent": row["owner_agent"],
+            "doc_id": goal.get("doc_id"),
+            "doc_title": titles.get(goal.get("doc_id"), ""),
+            "node_id": goal.get("node_id"),
+            "reason": (goal.get("reason") or "")[:160],
+            "created_at": row["created_at"],
+        }
+        for row, goal in parsed
+    ]
+
+
 async def _errata_counts(db: AsyncSession) -> dict[str, int]:
     try:
         rows = (
@@ -247,6 +291,7 @@ async def collect_signals(
         "zero_hit_queries": await _zero_hits(db, days, limit),
         "unused_heat": await _unused_heat(db, days, limit, unused_min),
         "pending_proposals": await _pending_proposals(db, limit),
+        "open_review_tasks": await _open_review_tasks(db, limit),
         "auto_rollbacks": await _recent_rollbacks(db, days, limit),
         "errata": await _errata_counts(db),
     }
