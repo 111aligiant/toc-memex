@@ -1049,12 +1049,21 @@ async def _safe_lesson(lesson_write, db: AsyncSession, **kwargs) -> int:
 
 
 async def recover_stale_jobs(db: AsyncSession) -> int:
-    """Requeue jobs whose worker died mid-run (ADR-0002 §9.4)."""
+    """Requeue jobs whose worker died mid-run (ADR-0002 §9.4).
+
+    ``updated_at`` is written by ``utcnow_iso()`` (ISO-8601 with a ``T``
+    separator), but SQLite's ``datetime('now', ...)`` emits a space
+    separator. Comparing the two as strings is silently wrong — ``'T'`` sorts
+    after ``' '``, so every stored timestamp reads as *newer* than the cutoff
+    and no job is ever recovered. Build the cutoff in the same format instead.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
     result = await db.execute(
         text(
             "UPDATE curation_jobs SET status='queued', last_error='stale heartbeat' "
-            "WHERE status='running' AND updated_at < datetime('now','-15 minutes')"
-        )
+            "WHERE status='running' AND updated_at < :cutoff"
+        ),
+        {"cutoff": cutoff},
     )
     await db.commit()
     return result.rowcount or 0

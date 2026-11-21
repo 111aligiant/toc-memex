@@ -336,7 +336,7 @@ class Dispatcher:
         ops = [payload.get("ops", [])[index] for index in pending_indexes]
         doc = await self.db.get(Document, self.doc_id)
         ctx = await build_context(self.db, doc, self.data_dir)
-        outcome = await apply_ops(ctx, ops, proposal_id, verify=self.verify)
+        outcome = await apply_ops(ctx, ops, proposal_id, verify=self.verify, approved=True)
         await self._handle_degraded(outcome, proposal_id, ops)
         row.verdict = "accepted" if outcome["applied_ops"] else "rejected"
         row.applied_ops = (row.applied_ops or 0) + outcome["applied_ops"]

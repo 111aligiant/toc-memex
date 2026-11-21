@@ -44,6 +44,10 @@ LOW_RISK = {
     "correct_text",
 }
 HIGH_RISK = {"set_page", "merge_nodes", "split_node"}
+# High-risk ops that actually have an applier in _apply_one, so a human
+# approval can apply them. merge_nodes / split_node are NOT here: they have no
+# applier and validate_op rejects them outright (no dead-end pending gate).
+_APPLIABLE_HIGH_RISK = {"set_page"}
 
 # OCR confusions a character-level correction may fix (§6.2).
 CONFUSION_PAIRS = {
@@ -368,10 +372,14 @@ async def validate_op(ctx: ProposalContext, op: dict) -> tuple[str, str]:
                 return "dropped", f"child {child.node_id} falls outside the new range"
         if not _evidence_on_pages(ctx, str(op.get("evidence") or ""), start, end):
             return "dropped", "evidence not found in the claimed range"
+        # High-risk but implemented: stays pending until a human approves.
         return "pending", ""
 
     if name in ("merge_nodes", "split_node"):
-        return "pending", ""
+        # These have no applier (_apply_one has no branch for them), so a
+        # pending status would leave the human approving an op that can never
+        # apply — a dead end. Reject them honestly instead.
+        return "dropped", f"op not implemented: {name}"
 
     return "dropped", f"op not implemented: {name}"
 
@@ -383,6 +391,7 @@ async def apply_ops(
     *,
     verify: bool = True,
     defer_low_risk: bool = False,
+    approved: bool = False,
 ) -> dict:
     """Validate and apply a whole proposal, op by op.
 
@@ -391,6 +400,12 @@ async def apply_ops(
     rest still run (mneme's "degrade, don't abort"). If applying would raise
     validate_toc's error count, everything applied so far is rolled back via
     the pre-write snapshot.
+
+    ``approved`` marks the human-approval re-entry (``dispatch.apply_proposal``):
+    an op that validated as ``pending`` because it is high-risk but *does*
+    have an applier (``set_page``) is promoted to ``ok`` and applied now,
+    instead of being left pending forever. Ops with no applier are already
+    dropped by ``validate_op``, so they never reach here.
 
     With ``verify`` (default on) the document is also measured before and
     after the write; a degraded verdict (``verify.compare_metrics``) rolls
@@ -418,6 +433,13 @@ async def apply_ops(
                 "pending",
                 "new strategy: awaiting human approval (canary)",
             )
+        if (
+            approved
+            and status == "pending"
+            and str(op.get("op") or "") in _APPLIABLE_HIGH_RISK
+        ):
+            # Human approved: a high-risk op that has a real applier proceeds.
+            status, reason = "ok", ""
         validated.append((index, op, status, reason))
 
     if any(status == "ok" for _, _, status, _ in validated):
@@ -565,6 +587,30 @@ async def _apply_one(ctx: ProposalContext, op: dict, proposal_id: str) -> None:
             page_start=chunk.page_start,
             page_end=chunk.page_end,
         )
+        # UNIQUE(doc_id, chunk_index) means the slot at chunk_index+1 may
+        # already be occupied: shift every later chunk up by one first, staging
+        # through negative values so no update collides with a row not yet
+        # moved (the same two-pass trick _renumber_chunks uses).
+        later = (
+            (
+                await db.execute(
+                    select(Chunk)
+                    .where(
+                        Chunk.doc_id == chunk.doc_id,
+                        Chunk.chunk_index > chunk.chunk_index,
+                    )
+                    .order_by(Chunk.chunk_index.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in later:
+            row.chunk_index = -row.chunk_index
+        await db.flush()
+        for row in later:
+            row.chunk_index = -row.chunk_index + 1
+        await db.flush()
         db.add(new)
         await db.flush()
         await _remap_chunk_references(ctx, {chunk.id: new.id}, proposal_id)
