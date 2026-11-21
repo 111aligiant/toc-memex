@@ -20,6 +20,33 @@ def test_non_loopback_is_allowed_when_explicitly_enabled():
     check_bind_host("0.0.0.0", allow_nonlocal=True)
 
 
+def test_enforce_bind_host_reads_the_env_var(monkeypatch):
+    from app.bindguard import enforce_bind_host
+    from app.config import get_settings
+
+    monkeypatch.setenv("TOCMEMEX_ALLOW_NONLOCAL", "1")
+    get_settings.cache_clear()
+    try:
+        enforce_bind_host("0.0.0.0")  # no SystemExit
+    finally:
+        get_settings.cache_clear()
+
+
+def test_enforce_bind_host_reads_dotenv(monkeypatch, tmp_path):
+    """The README promises "environment variables (or .env)"; honor both."""
+    from app.bindguard import enforce_bind_host
+    from app.config import get_settings
+
+    monkeypatch.delenv("TOCMEMEX_ALLOW_NONLOCAL", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("TOCMEMEX_ALLOW_NONLOCAL=1\n", encoding="utf-8")
+    get_settings.cache_clear()
+    try:
+        enforce_bind_host("0.0.0.0")  # no SystemExit
+    finally:
+        get_settings.cache_clear()
+
+
 def test_web_main_exits_before_uvicorn(monkeypatch, tmp_path):
     from app import web_api
 

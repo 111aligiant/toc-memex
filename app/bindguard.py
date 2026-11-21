@@ -9,7 +9,8 @@ to be explicit (``TOCMEMEX_ALLOW_NONLOCAL=1``).
 from __future__ import annotations
 
 import ipaddress
-import os
+
+from .config import get_settings
 
 
 def is_loopback_host(host: str) -> bool:
@@ -40,10 +41,11 @@ def enforce_bind_host(host: str) -> None:
     """Apply the bind policy and exit the CLI when it is violated.
 
     Shared by the web API, the inspector, and the MCP HTTP transport so a
-    new entry point cannot silently forget the check. Reads
-    ``TOCMEMEX_ALLOW_NONLOCAL`` itself.
+    new entry point cannot silently forget the check. Reads the setting
+    through ``Settings`` so ``TOCMEMEX_ALLOW_NONLOCAL`` works from the
+    environment *and* from ``.env``, like every other knob.
     """
-    allow_nonlocal = os.environ.get("TOCMEMEX_ALLOW_NONLOCAL") == "1"
+    allow_nonlocal = get_settings().tocmemex_allow_nonlocal
     try:
         check_bind_host(host, allow_nonlocal=allow_nonlocal)
     except ValueError as exc:

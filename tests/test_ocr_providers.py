@@ -54,6 +54,33 @@ def test_registry_picks_provider_and_rejects_unknown():
     assert set(SUPPORTED_PROVIDERS) == {"paddle", "mistral", "mineru", "azure"}
 
 
+def test_paddle_poll_falls_back_to_global_settings():
+    """TOCMEMEX_OCR_POLL_* is the documented knob and must reach Paddle."""
+    provider = PaddleOcrProvider(
+        _settings(
+            tocmemex_ocr_poll_timeout=7,
+            tocmemex_ocr_poll_interval=2,
+            paddleocr_poll_timeout=None,
+            paddleocr_poll_interval=None,
+        )
+    )
+    assert provider.poll_timeout == 7
+    assert provider.poll_interval == 2
+
+
+def test_paddle_poll_override_wins_when_set():
+    provider = PaddleOcrProvider(
+        _settings(
+            tocmemex_ocr_poll_timeout=7,
+            tocmemex_ocr_poll_interval=2,
+            paddleocr_poll_timeout=11,
+            paddleocr_poll_interval=3,
+        )
+    )
+    assert provider.poll_timeout == 11
+    assert provider.poll_interval == 3
+
+
 # ── cache round-trip ────────────────────────────────────────────────────
 
 

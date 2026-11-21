@@ -2,8 +2,24 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
+from pydantic import BeforeValidator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _blank_to_none(value):
+    """Treat an empty env var (``PADDLEOCR_POLL_TIMEOUT=``) as "unset".
+
+    ``.env.example`` ships these keys empty; without this a copied file
+    would fail validation for an ``int | None`` field.
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+OptionalInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
 
 
 class Settings(BaseSettings):
@@ -15,6 +31,11 @@ class Settings(BaseSettings):
 
     tocmemex_db_path: Path = Path("data/tocmemex.db")
     tocmemex_data_dir: Path = Path("data")
+
+    # Bind policy for the unauthenticated web / inspector / MCP HTTP entry
+    # points. False = loopback only (see ``app.bindguard``); True is the
+    # explicit opt-in for a LAN or reverse-proxied deployment.
+    tocmemex_allow_nonlocal: bool = False
 
     # OCR provider: "paddle" (default), "mistral", "mineru" or "azure".
     # Selecting a provider only affects the OCR fallback path; PDFs with a
@@ -30,8 +51,11 @@ class Settings(BaseSettings):
     paddleocr_api_token: str = ""
     paddleocr_api_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     paddleocr_api_model: str = "PaddleOCR-VL-1.6"
-    paddleocr_poll_timeout: int = 600
-    paddleocr_poll_interval: int = 5
+    # Optional per-provider overrides for the Paddle jobs API. None means
+    # "use the TOCMEMEX_OCR_POLL_* knobs above", so the documented global
+    # settings work for every provider unless one is pinned explicitly.
+    paddleocr_poll_timeout: OptionalInt = None
+    paddleocr_poll_interval: OptionalInt = None
 
     mistral_api_key: str = ""
     mistral_api_url: str = "https://api.mistral.ai/v1/ocr"

@@ -40,11 +40,13 @@ class PaddleOcrProvider(BaseOcrProvider):
 
     @property
     def poll_timeout(self) -> int:
-        return self.settings.paddleocr_poll_timeout
+        override = self.settings.paddleocr_poll_timeout
+        return override if override is not None else self.settings.tocmemex_ocr_poll_timeout
 
     @property
     def poll_interval(self) -> int:
-        return self.settings.paddleocr_poll_interval
+        override = self.settings.paddleocr_poll_interval
+        return override if override is not None else self.settings.tocmemex_ocr_poll_interval
 
     def _headers(self) -> dict[str, str]:
         self.check_config()
