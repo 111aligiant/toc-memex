@@ -475,6 +475,71 @@ async def _provenance(args) -> int:
         await engine.dispose()
 
 
+async def _toc_review(args) -> int:
+    """纲目复审：locate nodes whose titles are off their declared pages.
+
+    Dry run by default; ``--propose`` files the located ``set_page`` ops as
+    one pending proposal (high-risk ops always wait for a human).
+    """
+    from .curation.dispatch import Dispatcher
+    from .curation.ops import build_context
+    from .ingest.toc_review import review_document
+    from .models import Document
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            doc = await db.get(Document, args.doc_id)
+            if doc is None:
+                print(f"document not found: {args.doc_id}")
+                return 2
+            ctx = await build_context(db, doc, settings.tocmemex_data_dir)
+            report = await review_document(
+                db, doc, ctx.pages, limit=args.limit, window=args.window
+            )
+            proposal = None
+            if args.propose and report["proposed"]:
+                dispatcher = Dispatcher(
+                    db, settings.tocmemex_data_dir, doc.id
+                )
+                proposal = await dispatcher.propose_ops(
+                    [entry["op"] for entry in report["proposed"]],
+                    rationale="纲目复审：节点标题不在声明页，按页内定位修正",
+                )
+                await db.commit()
+        if args.json:
+            print(json.dumps({**report, "proposal": proposal}, ensure_ascii=False, indent=2))
+            return 0
+        if report["checked"] == 0:
+            print("no cached pages to review against (nothing checked)")
+            return 0
+        print(
+            f"{doc.title[:50]}: checked {report['checked']}, "
+            f"ok {report['ok']}, proposed {len(report['proposed'])}, "
+            f"ambiguous {len(report['ambiguous'])}, "
+            f"unlocatable {len(report['unlocatable'])}, "
+            f"skipped {report['skipped']}"
+        )
+        for entry in report["proposed"]:
+            print(
+                f"  FIX {entry['node_id']}: {entry['title'][:40]} "
+                f"pages {entry['declared'][0]}-{entry['declared'][1]} → {entry['found']}"
+            )
+        for entry in report["ambiguous"]:
+            print(f"  ?   {entry['node_id']}: {entry['title'][:40]} hits {entry['hits']}")
+        if proposal:
+            print(
+                f"proposal {proposal['proposal_id']} filed: "
+                f"pending {proposal['pending_ops']} / dropped {proposal['dropped_ops']}"
+            )
+        return 0
+    finally:
+        await engine.dispose()
+
+
 async def _baseline(args) -> int:
     """Create, list or restore document baselines (ADR-0002 §4)."""
     from .curation import baselines as baselines_mod
@@ -709,6 +774,20 @@ def main(argv: list[str] | None = None) -> int:
     collections.add_argument("action", choices=["list", "suggest", "apply"])
     collections.add_argument("--json", action="store_true")
 
+    review = sub.add_parser(
+        "toc-review",
+        help="纲目复审：locate nodes whose titles are off their declared pages",
+    )
+    review.add_argument("doc_id")
+    review.add_argument("--limit", type=int, default=20)
+    review.add_argument("--window", type=int, default=10)
+    review.add_argument(
+        "--propose",
+        action="store_true",
+        help="file the located fixes as one pending proposal (set_page waits for a human)",
+    )
+    review.add_argument("--json", action="store_true")
+
     args = parser.parse_args(argv)
     handlers = {
         "init": _init,
@@ -727,6 +806,7 @@ def main(argv: list[str] | None = None) -> int:
         "baseline": _baseline,
         "anchor-ids": _anchor_ids,
         "collections": _collections,
+        "toc-review": _toc_review,
     }
     return asyncio.run(handlers[args.command](args))
 
