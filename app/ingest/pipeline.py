@@ -960,6 +960,10 @@ async def _resolve_ocr_settings(settings: Settings) -> Settings:
         logger.warning("OCR endpoint resolution failed; using .env", exc_info=True)
         return settings
     if resolved is None:
+        logger.warning(
+            "no LLM endpoint configured (DB default + .env both empty); "
+            "纲目/编修 stay off and ingest takes the rule-based path"
+        )
         return settings
     return resolved["settings"]
 
@@ -986,6 +990,10 @@ async def _resolve_llm_settings(settings: Settings) -> tuple[Settings, str | Non
         logger.warning("LLM endpoint resolution failed; using .env", exc_info=True)
         return settings, None
     if resolved is None:
+        logger.warning(
+            "no LLM endpoint for 纲目 (bound + DB default + .env all empty); "
+            "TOC building takes the deterministic path"
+        )
         return settings, None
     return resolved, endpoint_name
 
