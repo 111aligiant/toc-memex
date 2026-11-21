@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -78,6 +81,65 @@ async def test_lock_records_a_visible_heartbeat(tmp_path):
         ).scalar_one()
         assert row == "finished"
     await engine.dispose()
+
+
+# ── liveness probe must never signal/kill the process it inspects ────────
+# On Windows os.kill(pid, 0) calls TerminateProcess and would *kill* a live
+# holder. These tests pin the safe ctypes behaviour: a running process is
+# reported alive and stays alive; a dead pid is reported dead.
+
+
+def test_pid_alive_sees_a_running_process_without_killing_it():
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        # Give the interpreter a moment to reach sleep().
+        deadline = time.time() + 5
+        while not curator_lock._pid_alive(child.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        assert curator_lock._pid_alive(child.pid) is True
+        # The bug being guarded against would have terminated it here.
+        assert child.poll() is None, "liveness probe must not kill a live process"
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+
+
+def test_pid_alive_reports_a_dead_pid():
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    assert curator_lock._pid_alive(child.pid) is False
+
+
+def test_is_stale_keeps_a_live_foreign_lock():
+    """A live holder's lock is not stale, and checking it must not kill it."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        deadline = time.time() + 5
+        while not curator_lock._pid_alive(child.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        info = {"run_id": "live", "pid": child.pid, "started": time.time()}
+        assert curator_lock._is_stale(info) is False
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+
+
+def test_is_stale_breaks_a_dead_pid_lock():
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait(timeout=10)
+    info = {"run_id": "dead", "pid": child.pid, "started": time.time()}
+    assert curator_lock._is_stale(info) is True
 
 
 # ── §6.4: wall-clock budget ──────────────────────────────────────────────

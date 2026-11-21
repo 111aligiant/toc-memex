@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -30,6 +31,47 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 LOCK_NAME = "curator.lock"
 STALE_SECONDS = 15 * 60
+
+_STILL_ACTIVE = 259
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if *pid* names a live process, never signalling/killing it.
+
+    On POSIX ``os.kill(pid, 0)`` only probes existence. On Windows, however,
+    ``os.kill`` routes through ``TerminateProcess`` — passing signal 0 would
+    *terminate* the target, so a liveness check must never use it. There we
+    open a handle with the cheapest possible right and read the exit code:
+    a still-running process reports ``STILL_ACTIVE`` (259). Any failure to
+    open (access denied / no such process) means "cannot prove it is ours",
+    so we treat it as not-alive and let the stale lock be broken.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid)
+        )
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            if not ok:
+                return False
+            return code.value == _STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 class CuratorBusy(RuntimeError):
@@ -59,8 +101,10 @@ def _is_stale(info: dict | None) -> bool:
     pid = info.get("pid")
     if pid and pid != os.getpid():
         # A pid that no longer exists means the holder died without cleaning up.
+        # Must never signal the process (os.kill on Windows would terminate it).
         try:
-            os.kill(int(pid), 0)
+            if not _pid_alive(int(pid)):
+                return True
         except (OSError, ValueError):
             return True
     return False
