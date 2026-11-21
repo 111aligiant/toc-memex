@@ -106,6 +106,11 @@ class Task(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # task | gangmu-review — a work type, so a review order can be listed
+    # apart from ordinary agent tasks (self-evolution §5.2).
+    kind: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="task", server_default="task"
+    )
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
     owner_agent: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)
@@ -147,6 +152,7 @@ async def task_create(
     goal: str | None = None,
     owner_agent: str | None = None,
     task_id: str | None = None,
+    kind: str = "task",
 ) -> Task:
     from ..models import new_uuid
 
@@ -155,6 +161,7 @@ async def task_create(
         title=title,
         goal=goal,
         owner_agent=owner_agent,
+        kind=kind,
     )
     db.add(task)
     await db.flush()
@@ -313,6 +320,7 @@ def task_out(task: Task) -> dict:
         "id": task.id,
         "title": task.title,
         "goal": task.goal,
+        "kind": task.kind,
         "status": task.status,
         "owner_agent": task.owner_agent,
         "created_at": task.created_at,

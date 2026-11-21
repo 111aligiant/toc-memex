@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 
 from sqlalchemy import select
 
@@ -26,6 +27,18 @@ from .curation.outcomes import strategy_report
 from .db import init_db, make_engine, session_factory
 from .ingest.pipeline import set_engine
 from .models import CurationProposal
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _safe(value: object, cap: int = 120) -> str:
+    """Operator-facing text: strip terminal control sequences, bound length.
+
+    Titles, queries, notes and error strings come from documents, users and
+    external agents. Printing them raw lets ANSI escapes rewrite the
+    operator's terminal.
+    """
+    return _CONTROL.sub(" ", str(value if value is not None else ""))[:cap]
 
 
 def _print_run(result: dict, as_json: bool) -> None:
@@ -39,7 +52,7 @@ def _print_run(result: dict, as_json: bool) -> None:
     )
     for doc in result["documents"]:
         applied = sum(job.get("applied", 0) for job in doc["jobs"])
-        print(f"  {doc['title'][:40]:42} applied {applied}")
+        print(f"  {_safe(doc['title'], 40):42} applied {applied}")
         for job in doc["jobs"]:
             if job.get("auto_rolled_back"):
                 state = "auto-rolled back (verification degraded)"
@@ -47,7 +60,7 @@ def _print_run(result: dict, as_json: bool) -> None:
                 state = job.get("skipped") or job.get("error") or (
                     f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
                 )
-            print(f"    {job.get('kind', '?'):16} {state}")
+            print(f"    {_safe(job.get('kind', '?'), 16):16} {_safe(state, 120)}")
     for job in result.get("search_jobs") or []:
         if job.get("pending"):
             state = "pending human approval"
@@ -55,7 +68,7 @@ def _print_run(result: dict, as_json: bool) -> None:
             state = job.get("skipped") or job.get("error") or (
                 f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
             )
-        print(f"  [search] {job.get('query', '')[:40]:42} {state}")
+        print(f"  [search] {_safe(job.get('query', ''), 40):42} {_safe(state, 120)}")
     print(f"total applied ops: {result['applied']}; skipped: {result['skipped']}")
     if result.get("timed_out"):
         print("达到墙钟预算，已提前结束；剩余文档留待下一轮。")
@@ -233,7 +246,7 @@ async def _verify(args) -> int:
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 0
-        print(f"{doc.title[:60]}")
+        print(f"{_safe(doc.title, 60)}")
         for name, value in (metrics or {}).items():
             print(f"  {name:8} {value}")
         if outcomes:
@@ -451,11 +464,11 @@ async def _replay(args) -> int:
         )
         for item in payload["queries"]:
             state = f"{item['hits']} hits" if item["hits"] else "0 hits"
-            docs = "、".join(doc["title"][:20] for doc in item["docs"][:3])
+            docs = "、".join(_safe(doc["title"], 20) for doc in item["docs"][:3])
             suffix = f"  → {docs}" if docs else ""
             print(
                 f"  {item['misses']:>3}× {item['tool']:<6} {state:<8} "
-                f"{item['query'][:50]}{suffix}"
+                f"{_safe(item['query'], 50)}{suffix}"
             )
         return 0
     finally:
@@ -497,7 +510,8 @@ async def _signals(args) -> int:
             print("零命中查询：")
             for item in misses:
                 print(
-                    f"  {item['misses']:>3}× {item['tool']:<6} {item['query'][:60]}"
+                    f"  {item['misses']:>3}× {_safe(item['tool'], 6):<6} "
+                    f"{_safe(item['query'], 60)}"
                 )
         unused = payload["unused_heat"]
         if unused:
@@ -505,7 +519,7 @@ async def _signals(args) -> int:
             for item in unused:
                 print(
                     f"  {item['searched']:>3} 次 / {item['queries']} 条查询  "
-                    f"{item['title'][:40]}"
+                    f"{_safe(item['title'], 40)}"
                 )
         print(f"待批提案：{len(payload['pending_proposals'])}")
         rollbacks = payload["auto_rollbacks"]
@@ -513,8 +527,9 @@ async def _signals(args) -> int:
             print("最近自动回滚：")
             for item in rollbacks:
                 print(
-                    f"  {item['kind'] or '-'} / {item['strategy'] or '-'}  "
-                    f"{item['title'][:32]}  {item['note']}"
+                    f"  {_safe(item['kind'] or '-', 40)} / "
+                    f"{_safe(item['strategy'] or '-', 40)}  "
+                    f"{_safe(item['title'], 32)}  {_safe(item['note'], 160)}"
                 )
         if payload["errata"]:
             print(

@@ -1798,7 +1798,11 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
             if job is None:
                 raise HTTPException(status_code=404, detail="job not found")
             dispatcher = Dispatcher(
-                session, app.state.data_dir, job.doc_id, job_id=job.id
+                session,
+                app.state.data_dir,
+                job.doc_id,
+                job_id=job.id,
+                allow_approval=True,  # this endpoint is the human approval surface
             )
             try:
                 result = await dispatcher.apply_proposal(proposal_id)

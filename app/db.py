@@ -102,6 +102,11 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
     first ORM query. Every patch is idempotent, so running on every start is
     cheap, and ``_add_column_if_missing`` absorbs the concurrent-start race.
     """
+    # tasks: work type (gangmu-review orders vs ordinary tasks)
+    await _add_column_if_missing(
+        conn, "tasks", "kind", "VARCHAR(30) NOT NULL DEFAULT 'task'"
+    )
+
     # agent_notes: replies, issue links, sessions, task timeline
     rows = await conn.execute(text("PRAGMA table_info(agent_notes)"))
     names = {row[1] for row in rows.fetchall()}

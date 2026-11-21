@@ -492,6 +492,45 @@ async def _toc_review(args) -> int:
     set_engine(engine)
     try:
         async with session_factory(engine)() as db:
+            if args.task:
+                from .ingest.toc_review import consume_review_task
+
+                try:
+                    result = await consume_review_task(
+                        db,
+                        settings.tocmemex_data_dir,
+                        args.task,
+                        limit=args.limit,
+                        window=args.window,
+                    )
+                except (LookupError, ValueError) as exc:
+                    await db.rollback()
+                    print(str(exc))
+                    return 1
+                await db.commit()
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    return 0
+                if result.get("skipped"):
+                    print(f"task {args.task}: {result['skipped']}")
+                    return 0
+                report = result["report"]
+                print(
+                    f"工单 {args.task} → {result['title'][:50]}: "
+                    f"checked {report['checked']}, proposed {len(report['proposed'])}, "
+                    f"ambiguous {len(report['ambiguous'])}, "
+                    f"unlocatable {len(report['unlocatable'])}"
+                )
+                if result.get("proposal"):
+                    proposal = result["proposal"]
+                    print(
+                        f"proposal {proposal['proposal_id']} filed: "
+                        f"pending {proposal['pending_ops']} / dropped {proposal['dropped_ops']}"
+                    )
+                return 0
+            if not args.doc_id:
+                print("需要 doc_id，或用 --task <id> 消费纲目复审工单")
+                return 2
             doc = await db.get(Document, args.doc_id)
             if doc is None:
                 print(f"document not found: {args.doc_id}")
@@ -778,7 +817,8 @@ def main(argv: list[str] | None = None) -> int:
         "toc-review",
         help="纲目复审：locate nodes whose titles are off their declared pages",
     )
-    review.add_argument("doc_id")
+    review.add_argument("doc_id", nargs="?")
+    review.add_argument("--task", default=None, help="consume a gangmu-review task id")
     review.add_argument("--limit", type=int, default=20)
     review.add_argument("--window", type=int, default=10)
     review.add_argument(

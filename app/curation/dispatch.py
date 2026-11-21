@@ -28,7 +28,12 @@ READ_TOOLS = {
     "get_printed_toc_llm": tools.get_printed_toc_llm,
 }
 
-WRITE_TOOLS = {"propose_ops", "apply_proposal", "get_proposal"}
+WRITE_TOOLS = {
+    "propose_ops",
+    "apply_proposal",
+    "get_proposal",
+    "request_toc_rebuild",
+}
 
 
 class DispatchError(ValueError):
@@ -78,6 +83,7 @@ class Dispatcher:
         budget: Budget | None = None,
         verify: bool = True,
         defer_low_risk: bool = False,
+        allow_approval: bool = False,
     ):
         self.db = db
         self.data_dir = data_dir
@@ -90,6 +96,11 @@ class Dispatcher:
         # New strategies start proposal-only (self-evolution §5.6 canary):
         # low-risk ops become pending until a human approves.
         self.defer_low_risk = defer_low_risk
+        # Only the human approval surface may open this door. An agent loop
+        # must never approve its own pending proposal, or the canary is
+        # decorative. The Web API constructs its approval dispatcher with
+        # allow_approval=True; the curator agent and MCP leave it False.
+        self.allow_approval = allow_approval
 
     async def dispatch(self, name: str, args: dict | None = None) -> dict:
         args = dict(args or {})
@@ -108,6 +119,10 @@ class Dispatcher:
         if name == "propose_ops":
             return await self.propose_ops(
                 args.get("ops") or [], args.get("rationale") or ""
+            )
+        if name == "request_toc_rebuild":
+            return await self.request_toc_rebuild(
+                str(args.get("node_id") or ""), str(args.get("reason") or "")
             )
         if name == "get_proposal":
             return await self.get_proposal(str(args.get("proposal_id") or ""))
@@ -217,6 +232,69 @@ class Dispatcher:
         self.job_id = job.id
         return job.id
 
+    async def request_toc_rebuild(self, node_id: str, reason: str) -> dict:
+        """File a gangmu-review work order instead of patching the TOC by hand.
+
+        ``set_page`` is the doctor doing surgery (self-evolution §5.2): a
+        structural error should go to 纲目, which re-derives the subtree and
+        files a proposal through the normal validation path. This tool only
+        writes the order (a ``tasks`` row of kind ``gangmu-review``) and a
+        hand-off note; it changes no content.
+        """
+        from ..index.activity import task_create
+        from ..ingest.toc_review import GANGMU_TASK_KIND, GANGMU_TASK_PREFIX
+        from ..models import AgentNote, TocNode
+        from sqlalchemy import select
+
+        doc = await self.db.get(Document, self.doc_id)
+        if doc is None:
+            raise DispatchError(f"document not found: {self.doc_id}")
+        if node_id:
+            node = (
+                await self.db.execute(
+                    select(TocNode).where(
+                        TocNode.doc_id == doc.id, TocNode.node_id == node_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if node is None:
+                raise DispatchError(f"node not in this document: {node_id}")
+        reason = (reason or "").strip() or "目录结构可疑，请求纲目复核"
+        goal = json.dumps(
+            {
+                "doc_id": doc.id,
+                "node_id": node_id or None,
+                "reason": reason[:2000],
+                "requested_by_job": self.job_id,
+            },
+            ensure_ascii=False,
+        )
+        task = await task_create(
+            self.db,
+            f"{GANGMU_TASK_PREFIX}{doc.title[:80]}",
+            goal=goal,
+            owner_agent="curator",
+            kind=GANGMU_TASK_KIND,
+        )
+        self.db.add(
+            AgentNote(
+                author="curator",
+                kind="handoff",
+                doc_id=doc.id,
+                task_id=task.id,
+                body=f"编修请求纲目复审：{reason[:600]}"
+                + (f"（争议子树根 {node_id}）" if node_id else ""),
+            )
+        )
+        await self.db.flush()
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "doc_id": doc.id,
+            "node_id": node_id or None,
+            "budget": self.budget.state(),
+        }
+
     async def get_proposal(self, proposal_id: str) -> dict:
         row = await self.db.get(CurationProposal, proposal_id)
         if row is None:
@@ -235,7 +313,16 @@ class Dispatcher:
 
         Re-validates every pending op; anything that no longer passes is
         reported and skipped rather than applied blind.
+
+        Approval is a human decision. The curator agent loop can call this
+        name (it is in ``WRITE_TOOLS``), so the dispatcher refuses unless it
+        was constructed by the approval surface with ``allow_approval=True``.
+        Without that, a canary proposal could approve itself.
         """
+        if not self.allow_approval:
+            raise DispatchError(
+                "apply_proposal requires a human approval surface"
+            )
         row = await self.db.get(CurationProposal, proposal_id)
         if row is None:
             raise DispatchError(f"proposal not found: {proposal_id}")
@@ -403,6 +490,33 @@ def tool_schemas() -> list[dict]:
                     "properties": {
                         "use_cache": {"type": "boolean", "default": True},
                     },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "request_toc_rebuild",
+                "description": (
+                    "File a 纲目复审 work order when the TOC structure itself "
+                    "is wrong (widespread page drift, broken hierarchy). Do "
+                    "not patch structural errors with set_page: 纲目 re-derives "
+                    "the subtree and files a proposal for human approval. "
+                    "Writes a task and a hand-off note; changes no content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": {
+                            "type": "string",
+                            "description": "root of the disputed subtree; omit for the whole document",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "what looks wrong, with concrete evidence",
+                        },
+                    },
+                    "required": ["reason"],
                 },
             },
         },

@@ -1264,6 +1264,23 @@ async def get_printed_toc_llm(doc_id: str, use_cache: bool = True) -> dict:
 
 
 @server.tool()
+async def request_toc_rebuild(
+    doc_id: str, reason: str, node_id: str = ""
+) -> dict:
+    """File a 纲目复审 work order when the TOC structure itself is wrong.
+
+    Writes a task (kind ``gangmu-review``) plus a hand-off note; changes no
+    content. 纲目 re-derives the subtree and files a proposal for human
+    approval. Use this instead of patching a structural error with set_page.
+    """
+    return await _curation_call(
+        doc_id,
+        "request_toc_rebuild",
+        {"node_id": node_id, "reason": reason},
+    )
+
+
+@server.tool()
 async def propose_ops(doc_id: str, ops: list[dict], rationale: str = "") -> dict:
     """Submit a fix program. Each op is validated; the response says
     accepted / pending_human / dropped, with a reason for every drop."""

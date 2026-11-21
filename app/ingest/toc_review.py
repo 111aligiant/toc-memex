@@ -143,3 +143,124 @@ async def review_document(
                 {"node_id": node.node_id, "title": node.title, "declared": [start, end]}
             )
     return report
+
+
+# ── work orders: 编修 asks 纲目 for a structural review (M3b) ──────────
+
+GANGMU_TASK_KIND = "gangmu-review"
+GANGMU_TASK_PREFIX = "纲目复审："
+
+
+async def _subtree_node_ids(db: AsyncSession, doc_id: str, root: str) -> set[str]:
+    nodes = (
+        (await db.execute(select(TocNode).where(TocNode.doc_id == doc_id)))
+        .scalars()
+        .all()
+    )
+    children: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.parent_id:
+            children.setdefault(node.parent_id, []).append(node.node_id)
+    seen: set[str] = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(children.get(current, []))
+    return seen
+
+
+async def consume_review_task(
+    db: AsyncSession,
+    data_dir,
+    task_id: str,
+    *,
+    limit: int = 20,
+    window: int = REVIEW_WINDOW,
+) -> dict:
+    """Run a ``gangmu-review`` work order: review the document, file a proposal.
+
+    The work order carries its document in ``goal`` as JSON
+    (``{"doc_id", "node_id", "reason"}``), because a task may span agents but
+    this one is about one document. A disputed subtree root limits the review
+    to that subtree; without it the whole document is reviewed.
+
+    The located ``set_page`` ops go through ``Dispatcher.propose_ops`` — high
+    risk, so they wait for a human exactly like a curator proposal. The task is
+    closed and a hand-off note anchored to both the task and the document
+    records what happened, even when nothing was locatable.
+    """
+    import json
+
+    from ..curation.dispatch import Dispatcher
+    from ..curation.ops import build_context
+    from ..index.activity import AgentNote, task_get, task_out, task_update
+
+    task = await task_get(db, task_id)
+    if task is None:
+        raise LookupError(f"task not found: {task_id}")
+    if task.kind != GANGMU_TASK_KIND:
+        raise ValueError(f"not a {GANGMU_TASK_KIND} task: {task.kind}")
+    if task.status in ("done", "archived"):
+        return {"task": task_out(task), "skipped": f"already {task.status}"}
+    try:
+        payload = json.loads(task.goal or "{}")
+    except ValueError:
+        payload = {}
+    doc_id = payload.get("doc_id") or ""
+    root = payload.get("node_id") or None
+    doc = await db.get(Document, doc_id) if doc_id else None
+    if doc is None:
+        raise LookupError(f"document not found for task {task_id}: {doc_id!r}")
+
+    await task_update(db, task_id, status="doing", owner_agent="gangmu")
+    ctx = await build_context(db, doc, data_dir)
+    report = await review_document(
+        db, doc, ctx.pages, limit=limit, window=window
+    )
+
+    ops = [entry["op"] for entry in report["proposed"]]
+    if root:
+        subtree = await _subtree_node_ids(db, doc.id, root)
+        ops = [op for op in ops if op.get("node_id") in subtree]
+        report["filtered_to"] = root
+        report["filtered_ops"] = len(ops)
+
+    proposal = None
+    if ops:
+        dispatcher = Dispatcher(db, data_dir, doc.id)
+        proposal = await dispatcher.propose_ops(
+            ops,
+            rationale=(
+                f"纲目复审工单 {task_id}："
+                f"{(payload.get('reason') or '节点标题不在声明页')[:300]}"
+            ),
+        )
+    await task_update(db, task_id, status="done", owner_agent="gangmu")
+    try:
+        db.add(
+            AgentNote(
+                author="gangmu",
+                kind="handoff",
+                doc_id=doc.id,
+                task_id=task.id,
+                body=(
+                    f"纲目复审 {task_id}：检查 {report['checked']} 个节点，"
+                    f"定位 {len(ops)} 个可修节点，"
+                    f"模糊 {len(report['ambiguous'])}，无法定位 {len(report['unlocatable'])}"
+                    + (f"；提案 {proposal['proposal_id']} 待批" if proposal else "；未产生提案")
+                ),
+            )
+        )
+        await db.flush()
+    except Exception:  # a note must not fail the work order
+        pass
+    return {
+        "task": task_out(task),
+        "doc_id": doc.id,
+        "title": doc.title,
+        "report": report,
+        "proposal": proposal,
+    }
