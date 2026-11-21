@@ -506,9 +506,11 @@ async def _apply_one(ctx: ProposalContext, op: dict, proposal_id: str) -> None:
         return
     if name == "set_summary":
         ctx.doc.summary = str(op["summary"]).strip()
+        await _refresh_doc_row(ctx)
         return
     if name == "set_keywords":
         ctx.doc.keywords = str(op["keywords"]).strip()
+        await _refresh_doc_row(ctx)
         return
     if name == "set_page":
         node = (
@@ -685,6 +687,19 @@ async def _rebuild_fts(ctx: ProposalContext) -> None:
     from ..index.fts import index_document
 
     await index_document(ctx.db, ctx.doc, await ctx.chunks())
+
+
+async def _refresh_doc_row(ctx: ProposalContext) -> None:
+    """Keep doc_fts in step after a document-row-only op.
+
+    ``set_keywords``/``set_summary`` change fields that only the document row
+    indexes; before this they were written to the model but never reached
+    doc_fts, so the zero-hit fallback and the document filter kept reading
+    the old values.
+    """
+    from ..index.fts import index_doc_row
+
+    await index_doc_row(ctx.db, ctx.doc)
 
 
 async def _rollback_last_snapshot(ctx: ProposalContext) -> None:

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from app.curation import verify as verify_mod
-from app.curation.ops import ProposalContext
+from app.curation.ops import ProposalContext, apply_ops
 from app.curation.search_quality import replay_zero_hits, zero_hit_queries
 from app.db import init_db, make_engine, session_factory
 from app.index.activity import UsageLog, usage_log_write
@@ -135,8 +135,43 @@ async def test_replay_reports_recovered_and_still_zero(tmp_path):
     await engine.dispose()
 
 
-# ── verifier integration ─────────────────────────────────────────────
+# ── closing the loop: set_keywords reaches search ────────────────────
 
+
+@pytest.mark.asyncio
+async def test_set_keywords_makes_a_missed_query_find_the_document(tmp_path):
+    """A keyword write is a real fix: doc_fts fallback answers the query."""
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        from app.index.fts import search_chunks
+
+        assert await search_chunks(db, "低温", top_k=8) == []
+        await usage_log_write(db, "低温", "search", [])
+        await db.commit()
+
+        doc = await db.get(Document, "d1")
+        ctx = ProposalContext(db=db, doc=doc, pages={}, data_dir=None)
+        outcome = await apply_ops(
+            ctx,
+            [{"op": "set_keywords", "keywords": "低温 寒冷"}],
+            "proposal-keywords",
+        )
+        await db.commit()
+        assert outcome["applied_ops"] == 1
+
+        hits = await search_chunks(db, "低温", top_k=8)
+        assert hits and hits[0]["doc_id"] == "d1"
+        assert hits[0]["match_type"] == "doc"
+
+        report = await replay_zero_hits(db, days=7, limit=10)
+    item = report["queries"][0]
+    assert item["query"] == "低温"
+    assert item["recovered"] is True
+    assert item["docs"][0]["doc_id"] == "d1"
+    await engine.dispose()
+
+
+# ── verifier integration ─────────────────────────────────────────────
 
 async def _context_with_history(db):
     chunk = (

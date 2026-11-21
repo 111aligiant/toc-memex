@@ -185,12 +185,37 @@ def _build_match(query: str, drop_identifiers: bool = False) -> str:
     return " OR ".join(dict.fromkeys(terms))
 
 
+async def index_doc_row(db: AsyncSession, doc: Document) -> None:
+    """(Re)write the document-level FTS row (title / summary / keywords).
+
+    Kept separate from ``index_document`` so an op that changes only the
+    document row (``set_keywords``, ``set_summary``) refreshes exactly what
+    the document filter and the zero-hit fallback read, without rebuilding
+    every chunk row.
+    """
+    await db.execute(
+        text("DELETE FROM doc_fts WHERE doc_id = :doc_id"), {"doc_id": doc.id}
+    )
+    await db.execute(
+        text(
+            """
+            INSERT INTO doc_fts(title, summary, keywords, doc_id)
+            VALUES (:title, :summary, :keywords, :doc_id)
+            """
+        ),
+        {
+            "title": seg_index(doc.title),
+            "summary": seg_index(doc.summary or ""),
+            "keywords": seg_index(doc.keywords or ""),
+            "doc_id": doc.id,
+        },
+    )
+    await db.flush()
+
+
 async def index_document(db: AsyncSession, doc: Document, chunks: list[Chunk]) -> None:
     await db.execute(
         text("DELETE FROM chunk_fts WHERE doc_id = :doc_id"), {"doc_id": doc.id}
-    )
-    await db.execute(
-        text("DELETE FROM doc_fts WHERE doc_id = :doc_id"), {"doc_id": doc.id}
     )
 
     for chunk in chunks:
@@ -211,21 +236,7 @@ async def index_document(db: AsyncSession, doc: Document, chunks: list[Chunk]) -
             },
         )
 
-    await db.execute(
-        text(
-            """
-            INSERT INTO doc_fts(title, summary, keywords, doc_id)
-            VALUES (:title, :summary, :keywords, :doc_id)
-            """
-        ),
-        {
-            "title": seg_index(doc.title),
-            "summary": seg_index(doc.summary or ""),
-            "keywords": seg_index(doc.keywords or ""),
-            "doc_id": doc.id,
-        },
-    )
-    await db.flush()
+    await index_doc_row(db, doc)
 
 
 def _row_to_hit(row, match_type: str) -> dict:
@@ -509,8 +520,26 @@ async def _search_chunks(
     # subword inside a longer indexed token ("泵" lives inside the token
     # "水泵"), and FTS matches whole tokens, so the MATCH returns nothing.
     # Fall back to a substring LIKE so such searches still have recall (B7).
+    # If the substring is absent too, fall through to the document channel:
+    # a keyword added by curation may name the concept the body only spells
+    # differently.
     if not merged and not identifier_routed and _is_short_cjk_query(query):
-        return await _like_search(db, query, top_k, routed_doc_ids)
+        like_hits = await _like_search(db, query, top_k, routed_doc_ids)
+        if like_hits:
+            return like_hits
+    if not merged:
+        # Document-level channel: a title or keyword set that contains every
+        # query term is a real answer even when no chunk repeats them (the
+        # body may be OCR-damaged, or the terms live in metadata). This is
+        # also what lets ``set_keywords`` close the search-quality loop: the
+        # keyword lands in doc_fts, so a query that missed before now returns
+        # the document instead of an empty page.
+        doc_hits = await search_doc_ids(db, query)
+        if routed_doc_ids is not None:
+            allowed = set(routed_doc_ids)
+            doc_hits = [doc_id for doc_id in doc_hits if doc_id in allowed]
+        if doc_hits:
+            return await _doc_fallback_hits(db, doc_hits, top_k)
     return merged
 
 
