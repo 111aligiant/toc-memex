@@ -593,15 +593,14 @@ async def search(
                 f"未找到分区「{collection}」，已改为全库检索；可用分区：{valid}"
             )
         hits = payload["results"]
-        if hits:
-            try:
-                await _activity.usage_log_write(
-                    db, query, "search", hits,
-                    actor_agent=actor_agent or None,
-                    task_id=task_id or None,
-                )
-            except Exception:
-                pass  # logging must never break retrieval
+        try:
+            await _activity.usage_log_write(
+                db, query, "search", hits,
+                actor_agent=actor_agent or None,
+                task_id=task_id or None,
+            )
+        except Exception:
+            pass  # logging must never break retrieval
         await db.commit()
     if hits:
         try:
@@ -649,15 +648,14 @@ async def ask(
         except _collections.CollectionNotFound as exc:
             raise _tool_error(exc) from exc
         hits = result.get("hits", [])
-        if hits:
-            try:
-                await _activity.usage_log_write(
-                    db, question, "ask", hits,
-                    actor_agent=actor_agent or None,
-                    task_id=task_id or None,
-                )
-            except Exception:
-                pass
+        try:
+            await _activity.usage_log_write(
+                db, question, "ask", hits,
+                actor_agent=actor_agent or None,
+                task_id=task_id or None,
+            )
+        except Exception:
+            pass
         try:
             errata = await _activity.confirmed_errata_hint(db, hits)
         except Exception:

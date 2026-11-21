@@ -726,11 +726,35 @@ async def usage_log_write(
     actor_agent: str | None = None,
     task_id: str | None = None,
 ) -> int:
-    """Persist one usage row per retrieved hit (rank preserved)."""
+    """Persist one usage row per retrieved hit (rank preserved).
+
+    A query with no hits writes a single ``rank=0`` row with no document, so a
+    miss is recorded instead of vanishing. That row is the raw material for the
+    search-quality loop (``docs/self-evolution.md`` §5.4.2): it says what people
+    asked for and the library could not answer. Hit rows keep ``rank >= 1``,
+    so ``rank = 0`` identifies a miss without a schema change; retrieval heat
+    ignores NULL-document rows.
+    """
     from ..models import new_uuid
 
     if task_id is not None and await db.get(Task, task_id) is None:
         task_id = None  # never let logging break retrieval
+    if not hits:
+        db.add(
+            UsageLog(
+                query=query[:1000],
+                tool=tool,
+                doc_id=None,
+                node_id=None,
+                chunk_id=None,
+                rank=0,
+                used=0,
+                actor_agent=actor_agent,
+                task_id=task_id,
+            )
+        )
+        await db.flush()
+        return 0
     for rank, hit in enumerate(hits, start=1):
         db.add(
             UsageLog(

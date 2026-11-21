@@ -34,6 +34,12 @@ from .outcomes import mark_regressed, record_outcome
 # A page-evidence ratio may wobble by this much before it counts as worse:
 # one node flip in a 50-node document should not spam rollbacks.
 PAGE_RATIO_TOLERANCE = 0.02
+# Historical-query replay: how many past queries to replay and where a rank
+# has to move before it counts as a regression. A write that shifts one
+# result by a place is noise; losing the document for a query is not.
+SEARCH_REPLAY_LIMIT = 5
+SEARCH_REPLAY_TOP_K = 10
+SEARCH_RANK_TOLERANCE = 1.0
 
 VERDICTS = ("better", "worse", "neutral")
 
@@ -56,6 +62,7 @@ async def snapshot_metrics(ctx) -> dict:
     except Exception:
         metrics["toc"] = None
     metrics["pages"] = _page_evidence(nodes or [], ctx)
+    metrics["search"] = await _search_replay(ctx)
     try:
         chunks = await ctx.chunks()
         node_map = {node.node_id: node for node in (nodes or await ctx.nodes())}
@@ -140,6 +147,64 @@ def _page_evidence(nodes: list[TocNode], ctx) -> dict | None:
     }
 
 
+async def _search_replay(ctx) -> dict | None:
+    """Replay this document's historical queries against the current index.
+
+    ``usage_log`` already records which real queries surfaced this document.
+    Re-running the most recent ones is the regression guard for relevance: a
+    write that merges away the chunk those queries matched, or pushes the
+    document out of the top results, is worse even when the TOC and chunk
+    metrics look fine (``docs/self-evolution.md`` §5.1.1, §5.4.2).
+
+    ``None`` when the document has no recorded queries — absence of history is
+    not a verdict. A failed replay drops that query rather than failing the
+    write.
+    """
+    try:
+        rows = (
+            await ctx.db.execute(
+                text(
+                    "SELECT query, MAX(id) AS last_id FROM usage_log "
+                    "WHERE doc_id = :doc AND rank >= 1 GROUP BY query "
+                    "ORDER BY last_id DESC LIMIT :k"
+                ),
+                {"doc": ctx.doc.id, "k": SEARCH_REPLAY_LIMIT},
+            )
+        ).all()
+    except Exception:
+        return None
+    if not rows:
+        return None
+
+    from ..index.fts import search_chunks
+
+    ranks: list[int] = []
+    for query, _last_id in rows:
+        try:
+            hits = await search_chunks(ctx.db, query, top_k=SEARCH_REPLAY_TOP_K)
+        except Exception:
+            continue
+        rank = next(
+            (
+                position
+                for position, hit in enumerate(hits, start=1)
+                if hit.get("doc_id") == ctx.doc.id
+            ),
+            None,
+        )
+        # A miss counts as one place past the window, so "still present but
+        # lower" and "gone" both move the rank in the same direction.
+        ranks.append(rank if rank is not None else SEARCH_REPLAY_TOP_K + 1)
+    if not ranks:
+        return None
+    return {
+        "queries": len(ranks),
+        "hit_docs": sum(1 for rank in ranks if rank <= SEARCH_REPLAY_TOP_K),
+        "mean_rank": round(sum(ranks) / len(ranks), 2),
+        "top_k": SEARCH_REPLAY_TOP_K,
+    }
+
+
 def compare_metrics(before: dict, after: dict) -> dict:
     """Verdict for one write: worse authorises rollback, better/neutral keep.
 
@@ -173,6 +238,28 @@ def compare_metrics(before: dict, after: dict) -> dict:
             )
         elif delta > PAGE_RATIO_TOLERANCE:
             improved.append("page-evidence")
+
+    search_before, search_after = _pick(before, "search"), _pick(after, "search")
+    if search_before and search_after:
+        hits_delta = search_after["hit_docs"] - search_before["hit_docs"]
+        rank_delta = round(search_after["mean_rank"] - search_before["mean_rank"], 2)
+        deltas["searchHits"] = hits_delta
+        deltas["searchRank"] = rank_delta
+        problems: list[str] = []
+        if hits_delta < 0:
+            problems.append(
+                f"historical queries finding this doc "
+                f"{search_before['hit_docs']} → {search_after['hit_docs']}"
+            )
+        if rank_delta > SEARCH_RANK_TOLERANCE:
+            problems.append(
+                f"mean replay rank {search_before['mean_rank']:.2f} → "
+                f"{search_after['mean_rank']:.2f}"
+            )
+        if problems:
+            reasons.append("; ".join(problems))
+        elif hits_delta > 0 or rank_delta < -SEARCH_RANK_TOLERANCE:
+            improved.append("search-replay")
 
     blocks_before, blocks_after = _pick(before, "blocks"), _pick(after, "blocks")
     if blocks_before and blocks_after:

@@ -3,6 +3,7 @@
     python -m app.curator run --once [--limit 10] [--agent|--no-agent]
     python -m app.curator run --every 360          # periodic maintenance loop
     python -m app.curator report
+    python -m app.curator replay [--days 7]      # zero-hit search queries, replayed
     python -m app.curator proposals [--doc ID] [--verdict pending]
     python -m app.curator audit                    # undo snapshots still present?
     python -m app.curator repair-snapshots         # backfill legacy snapshots
@@ -412,6 +413,46 @@ async def _proposals(args) -> int:
         await engine.dispose()
 
 
+async def _replay(args) -> int:
+    """Replay recorded zero-hit queries against the current index."""
+    from .curation.search_quality import replay_zero_hits
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            payload = await replay_zero_hits(
+                db, days=args.days, limit=args.limit, top_k=args.top
+            )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        if not payload["replayed"]:
+            print(
+                f"近 {args.days} 天没有零命中查询。"
+                "（MCP/Web 检索会把未命中记为 rank=0，CLI 检索不记账）"
+            )
+            return 0
+        print(
+            f"零命中查询回放（近 {payload['window_days']} 天，"
+            f"{payload['replayed']} 条）：已恢复 {payload['recovered']}，"
+            f"仍为 0 {payload['still_zero']}"
+        )
+        for item in payload["queries"]:
+            state = f"{item['hits']} hits" if item["hits"] else "0 hits"
+            docs = "、".join(doc["title"][:20] for doc in item["docs"][:3])
+            suffix = f"  → {docs}" if docs else ""
+            print(
+                f"  {item['misses']:>3}× {item['tool']:<6} {state:<8} "
+                f"{item['query'][:50]}{suffix}"
+            )
+        return 0
+    finally:
+        await engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="curator")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -471,6 +512,14 @@ def main(argv: list[str] | None = None) -> int:
     report = sub.add_parser("report", help="strategy outcomes")
     report.add_argument("--json", action="store_true")
 
+    replay = sub.add_parser(
+        "replay", help="replay recorded zero-hit queries against the current index"
+    )
+    replay.add_argument("--days", type=int, default=7)
+    replay.add_argument("--limit", type=int, default=50)
+    replay.add_argument("--top", type=int, default=8)
+    replay.add_argument("--json", action="store_true")
+
     proposals = sub.add_parser("proposals", help="list proposals")
     proposals.add_argument("--doc", default=None)
     proposals.add_argument("--verdict", default=None)
@@ -503,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         "audit": _audit,
         "repair-snapshots": _repair_snapshots,
         "verify": _verify,
+        "replay": _replay,
     }
     return asyncio.run(handlers[args.command](args))
 

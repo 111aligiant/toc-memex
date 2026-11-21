@@ -1499,17 +1499,18 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             # Retrieval usage is the signal the curator's heat score reads.
             # Without this every usage_log row came from MCP and a library
-            # read through the Web had heat 0 forever.
-            if payload["results"]:
-                from .index.activity import usage_log_write
+            # read through the Web had heat 0 forever. Zero-hit searches are
+            # logged too (rank 0), because they are what the search-quality
+            # loop needs most.
+            from .index.activity import usage_log_write
 
-                try:
-                    await usage_log_write(
-                        session, q, "web", payload["results"], actor_agent="human:web"
-                    )
-                    await session.commit()
-                except Exception:
-                    await session.rollback()  # logging must never break search
+            try:
+                await usage_log_write(
+                    session, q, "web", payload["results"], actor_agent="human:web"
+                )
+                await session.commit()
+            except Exception:
+                await session.rollback()  # logging must never break search
         hits = payload["results"]
         with closing(_connect(db_path)) as connection:
             docs = {
