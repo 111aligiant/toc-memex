@@ -231,3 +231,104 @@ async def test_curator_agent_resolves_the_db_default_endpoint(tmp_path, monkeypa
         assert result["endpoint"] == "magpie"
         assert "context" in captured
     await engine.dispose()
+
+
+# ── B8: message order + non-blocking LLM call ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_orders_assistant_before_tool_messages(tmp_path, monkeypatch):
+    """B8: the assistant(tool_calls) message must precede its tool results.
+
+    The loop used to append each tool result first and the assistant turn only
+    afterwards; OpenAI-style APIs reject that ordering (tool message without a
+    preceding assistant tool_call).
+    """
+    from app.curation.dispatch import Dispatcher
+    from app.db import init_db, make_engine, session_factory
+    from app.llm.client import ChatReply
+    from app.models import Document, Namespace
+
+    engine = make_engine(tmp_path / "tocmemex.db")
+    await init_db(engine)
+    async with session_factory(engine)() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        db.add(
+            Document(
+                id="d1", namespace_id="shared", title="Demo", filename="a.pdf",
+                file_path="a.pdf", content_hash="h", page_count=3, status="ready",
+            )
+        )
+        await db.commit()
+
+        seen_histories = []
+
+        def fake_chat(messages, settings=None, **kwargs):
+            # Snapshot the wire order the loop is about to send.
+            seen_histories.append([(m.role, bool(m.tool_calls)) for m in messages])
+            if len(seen_histories) == 1:
+                return ChatReply(
+                    content=None,
+                    tool_calls=[{"id": "c1", "type": "function",
+                                 "function": {"name": "get_quality", "arguments": "{}"}}],
+                    tokens={"prompt": 1, "completion": 1, "total": 2},
+                )
+            return ChatReply(content="done", tool_calls=[], tokens={"total": 1})
+
+        monkeypatch.setattr("app.llm.agent.llm_chat", fake_chat)
+        dispatcher = Dispatcher(db, tmp_path, "d1")
+        doc = await db.get(Document, "d1")
+        await run_tool_loop(dispatcher, doc, max_calls=5)
+        await db.commit()
+
+        # Second request carries the appended turn: assistant(with tool_calls)
+        # must come immediately before the tool result.
+        second = seen_histories[1]
+        roles = [r for r, _ in second]
+        idx_assistant = next(
+            i for i, (r, has_tc) in enumerate(second) if r == "assistant" and has_tc
+        )
+        idx_tool = roles.index("tool")
+        assert idx_assistant < idx_tool, f"assistant must precede tool: {second}"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_runs_llm_chat_off_the_event_loop(tmp_path, monkeypatch):
+    """B8: llm_chat is blocking; it must run in a worker thread, not on-loop."""
+    import threading
+
+    from app.curation.dispatch import Dispatcher
+    from app.db import init_db, make_engine, session_factory
+    from app.llm.client import ChatReply
+    from app.models import Document, Namespace
+
+    engine = make_engine(tmp_path / "tocmemex.db")
+    await init_db(engine)
+    async with session_factory(engine)() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        db.add(
+            Document(
+                id="d1", namespace_id="shared", title="Demo", filename="a.pdf",
+                file_path="a.pdf", content_hash="h", page_count=3, status="ready",
+            )
+        )
+        await db.commit()
+
+        main_thread = threading.get_ident()
+        seen = {}
+
+        def fake_chat(messages, settings=None, **kwargs):
+            seen["thread"] = threading.get_ident()
+            return ChatReply(content="done", tool_calls=[], tokens={"total": 1})
+
+        monkeypatch.setattr("app.llm.agent.llm_chat", fake_chat)
+        dispatcher = Dispatcher(db, tmp_path, "d1")
+        doc = await db.get(Document, "d1")
+        await run_tool_loop(dispatcher, doc, max_calls=5)
+        await db.commit()
+
+        assert seen["thread"] != main_thread, "llm_chat must not block the event loop"
+    await engine.dispose()

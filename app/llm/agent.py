@@ -16,6 +16,7 @@ the tool surface (ADR-0002 §16.1 decision 2).
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from ..curation.dispatch import Dispatcher, DispatchError, tool_schemas
@@ -129,7 +130,11 @@ async def run_tool_loop(
         if dispatcher.budget.calls_left <= 0:
             break
         try:
-            reply = llm_chat(
+            # llm_chat is synchronous and can block for seconds on the network;
+            # calling it directly would freeze the whole event loop (every other
+            # request stalls). Run it off-loop like agent/runner.py does.
+            reply = await asyncio.to_thread(
+                llm_chat,
                 messages,
                 settings,
                 tools=tools,
@@ -147,7 +152,35 @@ async def run_tool_loop(
         token_ok = dispatcher.budget.spend_tokens(
             (reply.tokens or {}).get("total") or 0
         )
+        if not reply.tool_calls:
+            # The no-tool turn is the agent's closing summary (see the system
+            # prompt): kept on the result for the job record and audit.
+            summary = (reply.content or "").strip() or None
+            break
+
+        # OpenAI-style APIs require the assistant message carrying tool_calls
+        # to come BEFORE the tool results it refers to. Append it first, then
+        # dispatch each call and append its tool result — never the reverse.
         assistant_tool_calls = []
+        for call in reply.tool_calls:
+            name = (call.get("function") or {}).get("name") or ""
+            assistant_tool_calls.append(
+                {
+                    "id": call.get("id") or f"call_{step}_{name}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": (call.get("function") or {}).get("arguments") or "{}",
+                    },
+                }
+            )
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content=reply.content,
+                tool_calls=assistant_tool_calls,
+            )
+        )
         for call in reply.tool_calls:
             name = (call.get("function") or {}).get("name") or ""
             args = _parse_arguments((call.get("function") or {}).get("arguments"))
@@ -162,16 +195,6 @@ async def run_tool_loop(
                 pending += int(result.get("pending_ops") or 0)
                 if result.get("proposal_id"):
                     proposals.append(result["proposal_id"])
-            assistant_tool_calls.append(
-                {
-                    "id": call.get("id") or f"call_{step}_{name}",
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": (call.get("function") or {}).get("arguments") or "{}",
-                    },
-                }
-            )
             messages.append(
                 ChatMessage(
                     role="tool",
@@ -180,18 +203,6 @@ async def run_tool_loop(
                     content=json.dumps(result, ensure_ascii=False, default=str),
                 )
             )
-        if not reply.tool_calls:
-            # The no-tool turn is the agent's closing summary (see the system
-            # prompt): kept on the result for the job record and audit.
-            summary = (reply.content or "").strip() or None
-            break
-        messages.append(
-            ChatMessage(
-                role="assistant",
-                content=reply.content,
-                tool_calls=assistant_tool_calls,
-            )
-        )
         if not token_ok:
             break
 
