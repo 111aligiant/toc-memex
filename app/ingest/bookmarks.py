@@ -9,6 +9,18 @@ from .heading import parse_heading
 # Header/footer/address noise: URLs and bare document-number lines.
 _PAGE_FURNITURE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
+# Auto-generated outlines that bookmark every page: "Page 3", "第 12 页",
+# "Seite 4". A title that is only a page label carries no structure.
+_PAGE_LABEL = re.compile(
+    r"^(?:page|p\.?|seite|página|página|页|第)\s*[0-9０-９]+\s*页?$", re.IGNORECASE
+)
+
+# Sentence punctuation and math notation never appear in a real heading.
+# Outlines auto-built by authoring tools bookmark displayed equations and
+# body lines too ("2Al + N2 -> 2AlN (2-1)", "…，无定形"); a title carrying
+# any of these marks is one of them, not a section.
+_NON_HEADING_MARKS = tuple("。，：；＝→←＿＾+*\"“”‘’?!？!")
+
 # Legitimate unnumbered sections worth keeping from a PDF outline.
 _KEEP_UNNUMBERED = {
     "前言",
@@ -90,37 +102,78 @@ def filter_bookmarks(bookmarks: list[Bookmark]) -> list[Bookmark]:
     lines, and every entry may be level 1. Keeping only numbered headings
     and re-leveling them (8.3 → level 2) turns the outline into a usable
     tree.
+
+    Exception: entries the authoring tool wrote itself
+    (``Bookmark.from_outline``) keep unnumbered titles ("Introduction",
+    "Abstract") with their authored level — dropping them would leave an
+    English paper with no tree at all. Their junk is handled structurally:
+    sentence/math marks and page-label titles ("Page 12") are dropped.
+
+    Running headers are dropped for both sources: a title (spacing
+    normalized) that appears on three or more distinct pages is page
+    furniture, not a heading — thesis templates bookmark the running
+    "第一章 绪论" line on every page.
     """
+    pages_by_title: dict[str, set[int]] = {}
+    for bookmark in bookmarks:
+        key = "".join((bookmark.title or "").split())
+        if key:
+            pages_by_title.setdefault(key, set()).add(bookmark.page_index)
+    running_headers = {
+        key for key, pages in pages_by_title.items() if len(pages) >= 3
+    }
+
     result: list[Bookmark] = []
     seen: set[tuple[str, int]] = set()
+    outline_titles: set[str] = set()
 
     for bookmark in bookmarks:
         title = " ".join((bookmark.title or "").split())
         if (
             not title
             or len(title) > 200
+            or "".join(title.split()) in running_headers
             or _PAGE_FURNITURE.search(title)
             or is_bare_designation(title)
+            or (bookmark.from_outline and _PAGE_LABEL.fullmatch(title))
+            or (bookmark.from_outline and any(mark in title for mark in _NON_HEADING_MARKS))
         ):
             continue
 
         parsed = parse_heading(title)
         if parsed is None:
-            continue
-        num, _, level = parsed
-        if num is None and "".join(title.split()) not in _KEEP_UNNUMBERED_COMPACT:
-            continue
+            if not bookmark.from_outline:
+                continue
+            num, _, level = None, title, max(1, min(6, bookmark.level))
+        else:
+            num, _, level = parsed
+            if num is None:
+                if bookmark.from_outline:
+                    level = max(1, min(6, bookmark.level))
+                elif "".join(title.split()) not in _KEEP_UNNUMBERED_COMPACT:
+                    continue
+                else:
+                    level = 1
 
-        key = (title, bookmark.page_index)
-        if key in seen:
-            continue
-        seen.add(key)
+        if bookmark.from_outline:
+            # An authored outline lists each section once; a spaced variant
+            # of a title already seen is the same section twice.
+            norm = "".join(title.split())
+            if norm in outline_titles:
+                continue
+            outline_titles.add(norm)
+        else:
+            key = (title, bookmark.page_index)
+            if key in seen:
+                continue
+            seen.add(key)
         result.append(
             Bookmark(
-                level=level if num else 1,
+                level=level,
                 title=title,
                 page_index=max(0, bookmark.page_index),
                 heading_num=num,
+                from_outline=bookmark.from_outline,
             )
         )
 

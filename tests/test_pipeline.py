@@ -15,6 +15,7 @@ from app.ingest.pipeline import (
     _local_image_source,
     _image_headers,
     ingest_path,
+    parse_markdown,
     save_resources,
     set_engine,
 )
@@ -421,6 +422,19 @@ async def test_ingest_persists_subtree_chunk_ranges(tmp_path):
     await engine.dispose()
 
 
+def test_markdown_bom_does_not_hide_the_first_heading(tmp_path):
+    """A UTF-8 BOM must not swallow the first H1 (it did: "﻿# 1 Scope")."""
+    md = tmp_path / "bom.md"
+    md.write_text("﻿# 1 Scope\n\n# 8 Test methods\n", encoding="utf-8")
+
+    parsed = parse_markdown(md)
+
+    assert [bookmark.title for bookmark in parsed.bookmarks] == [
+        "1 Scope",
+        "8 Test methods",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_ingest_markdown_direct(tmp_path):
     engine = make_engine(tmp_path / "tocmemex.db")
@@ -758,3 +772,44 @@ async def test_ingest_reuses_failed_row_instead_of_reporting_duplicate(tmp_path)
     assert doc.error is None
     assert chunks >= 1
     await engine.dispose()
+
+
+# ── authored PDF outline preferred over text-line heuristics ───────────
+
+
+def test_prefer_outline_bookmarks_trusts_a_real_tree(monkeypatch):
+    from app.ingest import pipeline
+    from app.ocr.models import Bookmark
+
+    outline = [
+        Bookmark(1, "Nitridation reaction", 0, from_outline=True),
+        Bookmark(2, "Introduction", 0, from_outline=True),
+        Bookmark(3, "Reactor design", 2, from_outline=True),
+    ]
+    synth = [
+        Bookmark(1, "3 H (2) The free-energy change of reaction", 1),
+        Bookmark(1, "2016 Y. Qiu, L. Gao / Journal", 1),
+    ]
+    monkeypatch.setattr(pipeline, "read_pdf_bookmarks", lambda path: outline)
+    assert (
+        pipeline._prefer_outline_bookmarks(synth, Path("a.pdf")) is outline
+    )
+
+
+def test_prefer_outline_keeps_heuristics_for_a_junky_outline(monkeypatch):
+    from app.ingest import pipeline
+    from app.ocr.models import Bookmark
+
+    outline = [
+        Bookmark(1, "Contents", 0, from_outline=True),
+        Bookmark(1, "Chapter 1", 1, from_outline=True),
+    ]
+    synth = [
+        Bookmark(1, "1 范围", 1),
+        Bookmark(1, "2 要求", 2),
+        Bookmark(1, "3 方法", 3),
+    ]
+    monkeypatch.setattr(pipeline, "read_pdf_bookmarks", lambda path: outline)
+    assert (
+        pipeline._prefer_outline_bookmarks(synth, Path("a.pdf")) is synth
+    )

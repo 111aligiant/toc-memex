@@ -99,6 +99,7 @@ def save_bookmarks(settings: Settings, doc_id: str, bookmarks: list[Bookmark]) -
             "title": bookmark.title,
             "page_index": bookmark.page_index,
             "heading_num": bookmark.heading_num,
+            "from_outline": bookmark.from_outline,
         }
         for bookmark in bookmarks
     ]
@@ -124,6 +125,7 @@ def load_bookmarks(settings: Settings, doc_id: str) -> list[Bookmark]:
                 title=title,
                 page_index=max(0, int(item.get("page_index") or 0)),
                 heading_num=item.get("heading_num"),
+                from_outline=bool(item.get("from_outline")),
             )
         )
     return bookmarks
@@ -139,15 +141,40 @@ def read_pdf_bookmarks(path: Path) -> list[Bookmark]:
             level=int(entry.get("level") or 1),
             title=str(entry["title"]),
             page_index=max(0, int(entry.get("page") or 1) - 1),
+            from_outline=True,
         )
         for entry in entries
         if entry.get("title")
     ]
 
 
+def _prefer_outline_bookmarks(synth: list[Bookmark], path: Path) -> list[Bookmark]:
+    """The authored PDF outline beats text-line heading heuristics.
+
+    Heading heuristics over the text layer misread equation lines and page
+    furniture as headings; the outline is metadata the authoring tool wrote.
+    Trust it whenever it survives junk filtering as a real tree (enough
+    entries, and either nested levels or a solid flat list). A PDF whose
+    outline is junk or missing keeps the heuristic bookmarks — this is a
+    per-document decision, not a format rule.
+    """
+    outline = read_pdf_bookmarks(path)
+    if len(outline) < 2:
+        return synth
+    from .bookmarks import filter_bookmarks
+
+    kept = filter_bookmarks(outline)
+    levels = {bookmark.level for bookmark in kept}
+    if len(kept) >= 3 and (len(levels) >= 2 or len(kept) >= 5):
+        return outline
+    return synth
+
+
 def parse_markdown(path: Path) -> ParsedDocument:
     """Markdown/TXT: each heading starts a synthetic page; bookmarks carry levels."""
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    # ``utf-8-sig`` strips a BOM: a leading U+FEFF otherwise hides the first
+    # heading ("<BOM># 1 Scope") from ``_HEADING_RE`` and silently drops it.
+    text = path.read_text(encoding="utf-8-sig", errors="ignore")
     lines = text.splitlines()
 
     sections: list[tuple[int, str, list[str]]] = []
@@ -445,10 +472,7 @@ async def _parse(
                 )
                 parsed = None
             if parsed is not None:
-                # Text-detected headings carry exact pages; only fall back to
-                # the PDF outline when the text layer yielded no headings.
-                if not parsed.bookmarks:
-                    parsed.bookmarks = read_pdf_bookmarks(path)
+                parsed.bookmarks = _prefer_outline_bookmarks(parsed.bookmarks, path)
                 from .pdf_media import attach_pdf_text_media
 
                 attach_pdf_text_media(path, parsed, settings.ocr_dir / doc_id)
