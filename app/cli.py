@@ -192,7 +192,9 @@ async def _toc(args) -> int:
         async with session_factory(engine)() as db:
             rows = (
                 await db.execute(
-                    select(TocNode).where(TocNode.doc_id == args.doc_id)
+                    select(TocNode)
+                    .where(TocNode.doc_id == args.doc_id)
+                    .order_by(TocNode.id)
                 )
             ).scalars().all()
         if not rows:
@@ -220,23 +222,13 @@ async def _toc(args) -> int:
                 f"{indent}{node.node_id} [{node.level}] {node.title} "
                 f"pages {pages} ({node.source})"
             )
-            children = sorted(
-                by_parent.get(node.node_id, []),
-                key=lambda item: (
-                    item.page_start if item.page_start is not None else 10**9,
-                    item.node_id,
-                ),
-            )
-            for child in children:
+            # Stored order is the tree's own reading order (rows come ordered
+            # by id); re-sorting by page here scrambles siblings whenever one
+            # page mapping is off.
+            for child in by_parent.get(node.node_id, []):
                 emit(child, depth + 1)
 
-        for root in sorted(
-            roots,
-            key=lambda item: (
-                item.page_start if item.page_start is not None else 10**9,
-                item.node_id,
-            ),
-        ):
+        for root in roots:
             emit(root, 0)
 
         issues = validate_toc(rows)
