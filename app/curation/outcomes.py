@@ -218,7 +218,12 @@ async def settle_outcomes(
 
 
 async def strategy_report(db: AsyncSession) -> list[dict]:
-    """Per-strategy tallies for ``python -m app.curator report``."""
+    """Per-strategy tallies for ``python -m app.curator report``.
+
+    Also tallies the observation-window state (``survived`` / ``regressed``
+    / ``pending``): the survival rate is what the progressive-autonomy gate
+    (self-evolution §5.6) will read once strategies have enough samples.
+    """
     rows = (
         (await db.execute(select(CurationOutcome).order_by(CurationOutcome.id)))
         .scalars()
@@ -229,10 +234,13 @@ async def strategy_report(db: AsyncSession) -> list[dict]:
         bucket = buckets.setdefault(
             row.strategy or row.action,
             {"strategy": row.strategy or row.action, "applied": 0, "better": 0,
-             "worse": 0, "neutral": 0, "delta": {}},
+             "worse": 0, "neutral": 0, "survived": 0, "regressed": 0,
+             "pending": 0, "delta": {}},
         )
         bucket["applied"] += 1
         bucket[row.verdict] = bucket.get(row.verdict, 0) + 1
+        survival = row.survival or "pending"
+        bucket[survival] = bucket.get(survival, 0) + 1
         if row.delta_json:
             try:
                 for key, value in json.loads(row.delta_json).items():

@@ -339,12 +339,17 @@ async def _report(args) -> int:
         if not rows:
             print("no outcomes yet; run `python -m app.curator run --once`")
             return 0
-        print(f"{'策略':<18}{'应用':>6}{'更好':>6}{'更差':>6}{'持平':>6}  平均 delta")
+        print(
+            f"{'策略':<18}{'应用':>6}{'更好':>6}{'更差':>6}{'持平':>6}"
+            f"{'存活':>6}{'回退':>6}{'观察中':>7}  平均 delta"
+        )
         for row in rows:
             delta = ", ".join(f"{key} {value:+}" for key, value in row["delta"].items()) or "-"
             print(
                 f"{row['strategy']:<18}{row['applied']:>6}{row['better']:>6}"
-                f"{row['worse']:>6}{row['neutral']:>6}  {delta}"
+                f"{row['worse']:>6}{row['neutral']:>6}"
+                f"{row.get('survived', 0):>6}{row.get('regressed', 0):>6}"
+                f"{row.get('pending', 0):>7}  {delta}"
             )
         return 0
     finally:
