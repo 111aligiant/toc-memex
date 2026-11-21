@@ -14,12 +14,13 @@ const emit = defineEmits(['select', 'toggle'])
 const visible = computed(() => {
   const out = []
   const byParent = new Map()
+  const nodeIds = new Set()
+  for (const node of props.nodes) nodeIds.add(node.node_id)
   for (const node of props.nodes) {
     const parent = node.parent_id
     if (!byParent.has(parent)) byParent.set(parent, [])
     byParent.get(parent).push(node)
   }
-  const rootParentIds = new Set(props.nodes.map((node) => node.parent_id))
   const walk = (node, depth) => {
     out.push({ node, depth })
     if (props.expanded.includes(node.node_id)) {
@@ -27,7 +28,12 @@ const visible = computed(() => {
     }
   }
   for (const node of props.nodes) {
-    if (!node.parent_id || !rootParentIds.has(node.parent_id)) walk(node, 0)
+    // A node is a top-level root when it has no parent, or when its declared
+    // parent is missing from this list (an orphan). The old check tested
+    // membership in the set of *all* parent ids, which is always true for a
+    // node that has a parent, so orphans were silently dropped and never
+    // rendered.
+    if (!node.parent_id || !nodeIds.has(node.parent_id)) walk(node, 0)
   }
   return out
 })

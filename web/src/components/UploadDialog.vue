@@ -6,7 +6,7 @@
  * dialog does not cancel anything — the document still appears in the
  * library when ingest finishes.
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { fetchUpload, uploadDocument } from '@/api'
 import { useCollectionsStore } from '@/stores/collections'
 import { useUiStore } from '@/stores/ui'
@@ -41,6 +41,17 @@ const dragging = ref(false)
 const uploading = ref(false)
 const fileInput = ref(null)
 let runToken = 0
+// Give up polling a single row after this many consecutive fetch failures so a
+// permanently failing status endpoint cannot keep the loop spinning at 1.5 s
+// forever (see the poll loop in start()).
+const MAX_POLL_FAILURES = 3
+
+// The dialog can unmount mid-upload (route change, HMR). Bump the run token so
+// the in-flight poll loop bails out on its next check instead of leaking a
+// timer that polls a dead component.
+onUnmounted(() => {
+  runToken += 1
+})
 
 watch(
   () => props.open,
@@ -197,8 +208,17 @@ async function start() {
           item.docId = data.docId || ''
           item.error = data.error || ''
           item.message = data.message || ''
+          item.pollFailures = 0
         } catch (error) {
-          item.error = error.message
+          // A transient error keeps the row in the poll set; a persistent one
+          // is terminal so the loop can stop instead of hammering the server.
+          item.pollFailures = (item.pollFailures || 0) + 1
+          if (item.pollFailures >= MAX_POLL_FAILURES) {
+            item.status = 'failed'
+            item.error = error.message
+          } else {
+            item.error = error.message
+          }
         }
       }),
     )

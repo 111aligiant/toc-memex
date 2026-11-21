@@ -321,6 +321,12 @@ function preferredSeq(stepsList) {
 }
 
 async function refresh(id) {
+  // Cancel any poll already scheduled for this view before we schedule a new
+  // one. refresh() is called from several places (start, openRun, restoreView,
+  // stopRun) as well as from the poll timer itself; without this, a direct
+  // call while a timer is pending would start a second, independent
+  // self-rescheduling loop and double the request rate.
+  stopPolling()
   try {
     const data = await fetchRun(id)
     run.value = data.run
@@ -669,6 +675,9 @@ function stepTone(step) {
 async function stopRun() {
   if (!run.value || stopping.value) return
   stopping.value = true
+  // Stop the poll loop now: the run is being cancelled, so the next poll we
+  // schedule would only race the cancel and re-fetch a run we are ending.
+  stopPolling()
   try {
     await cancelRun(run.value.id)
     await refresh(run.value.id)
