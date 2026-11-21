@@ -12,6 +12,7 @@ from ..ocr.cache import load_pages
 from ..ocr.models import ParsedDocument
 from ..ocr.parser import page_text, parse_jsonl
 from .pipeline import (
+    _attach_gangmu_lessons,
     _resolve_llm_settings,
     _resolve_ocr_settings,
     backfill_images,
@@ -114,6 +115,7 @@ async def reindex_document(doc_id: str, settings: Settings | None = None) -> str
     """
     settings = settings or get_settings()
     llm_settings, llm_endpoint_name = await _resolve_llm_settings(settings)
+    llm_settings = await _attach_gangmu_lessons(get_engine(), doc_id, llm_settings)
     Session = session_factory(get_engine())
     async with Session() as db:
         doc = await db.get(Document, doc_id)

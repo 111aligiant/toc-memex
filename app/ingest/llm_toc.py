@@ -75,6 +75,24 @@ def _render(settings: Settings, key: str, default: str, **values) -> str:
     except (KeyError, IndexError, ValueError):
         return default.format(**values)
 
+
+def _lessons_hint(settings: Settings) -> str:
+    """Past lessons attached by the ingest pipeline (self-evolution §5.5).
+
+    The block is appended to the semantic prompts (transform / verify /
+    fix), never to the per-page detector: that one runs once per page, so
+    a block there would multiply token cost by the scan limit. Empty when
+    no lessons were attached, which keeps bench and test paths identical
+    to the pre-lesson behaviour.
+    """
+    lessons = str(gangmu_config(settings).get("lessons") or "").strip()
+    if not lessons:
+        return ""
+    return (
+        "\n\nPrevious experience on similar documents (reference only; "
+        "the page text always wins):\n" + lessons
+    )
+
 # Furniture labels never sent to the LLM (mirrors chunker's skip set plus
 # OCR footer page numbers).
 _SKIP_LABELS = {
@@ -250,6 +268,7 @@ def extract_toc_entries_llm(
         _prompt(settings, "transform", _TOC_TRANSFORM_PROMPT)
         + "\n Given table of contents\n:"
         + content
+        + _lessons_hint(settings)
     )
     try:
         payload = extract_json(llm_complete(prompt, settings, doc_id=doc_id))
@@ -375,7 +394,7 @@ def verify_entries_llm(
             _VERIFY_PROMPT,
             title=entry.title,
             page_text=page_texts[entry.page_index],
-        )
+        ) + _lessons_hint(settings)
         try:
             answer = extract_json(llm_complete(prompt, settings, doc_id=doc_id))
             verdict = str(answer.get("answer", "no")).lower()
@@ -460,6 +479,7 @@ def fix_entries_llm(
             continue
         prompt = fix_prompt + "\nSection Title:\n" + entries[index].title
         prompt += "\nDocument pages:\n" + "\n".join(window_texts)
+        prompt += _lessons_hint(settings)
         located: int | None = None
         for _ in range(max(1, effective_attempts)):
             try:

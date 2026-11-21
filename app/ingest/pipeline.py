@@ -998,6 +998,40 @@ async def _resolve_llm_settings(settings: Settings) -> tuple[Settings, str | Non
     return resolved, endpoint_name
 
 
+async def _attach_gangmu_lessons(
+    engine, doc_id: str, settings: Settings
+) -> Settings:
+    """Attach lessons relevant to this document to the 纲目 config (§5.5).
+
+    Retrieval is keyword-based over the document title plus "目录 TOC"
+    (``index.activity.lesson_search``); the block rides on
+    ``settings.tocmemex_gangmu["lessons"]`` and is appended to the
+    transform / verify / fix prompts. Advisory only: any failure — no
+    engine, empty table, odd row — returns the settings untouched.
+    """
+    try:
+        from ..index.activity import lesson_search
+
+        Session = session_factory(engine)
+        async with Session() as db:
+            doc = await db.get(Document, doc_id)
+            if doc is None:
+                return settings
+            lessons = await lesson_search(db, f"{doc.title or ''} 目录 TOC", top_k=4)
+        if not lessons:
+            return settings
+        block = "\n".join(
+            f"- {lesson.trigger}: {lesson.issue} → {lesson.solution}"
+            for lesson in lessons
+        )
+        cfg = dict(settings.tocmemex_gangmu or {})
+        cfg["lessons"] = block
+        return settings.model_copy(update={"tocmemex_gangmu": cfg})
+    except Exception:
+        logger.warning("纲目 lesson retrieval failed; continuing without", exc_info=True)
+        return settings
+
+
 IMAGE_MODES = ("structured", "text")
 
 
@@ -1315,6 +1349,7 @@ async def ingest_path(
         else settings
     )
     llm_settings, llm_endpoint_name = await _resolve_llm_settings(settings)
+    llm_settings = await _attach_gangmu_lessons(engine, doc_id, llm_settings)
     parse_provenance: dict = {}
     try:
         await _set_doc_state(engine, doc_id, stage=parse_stage(path), progress=15)
