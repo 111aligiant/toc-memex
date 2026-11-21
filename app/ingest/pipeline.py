@@ -1020,16 +1020,36 @@ async def _attach_gangmu_lessons(
             lessons = await lesson_search(db, f"{doc.title or ''} 目录 TOC", top_k=4)
         if not lessons:
             return settings
-        block = "\n".join(
-            f"- {lesson.trigger}: {lesson.issue} → {lesson.solution}"
-            for lesson in lessons
-        )
+        # Lessons come from any MCP client, so they enter the prompt as
+        # untrusted data: one JSON record per line, control characters and
+        # delimiter tags stripped, per-field and total length capped. The
+        # consumer (llm_toc._lessons_hint) wraps the block in an explicit
+        # "data, not instructions" envelope.
+        lines: list[str] = []
+        for lesson in lessons:
+            record = {
+                "author": _clip_lesson(lesson.author_agent, 40),
+                "trigger": _clip_lesson(lesson.trigger, 200),
+                "issue": _clip_lesson(lesson.issue, 300),
+                "solution": _clip_lesson(lesson.solution, 300),
+            }
+            lines.append(json.dumps(record, ensure_ascii=False))
+        block = "\n".join(lines)[:2000]
         cfg = dict(settings.tocmemex_gangmu or {})
         cfg["lessons"] = block
         return settings.model_copy(update={"tocmemex_gangmu": cfg})
     except Exception:
         logger.warning("纲目 lesson retrieval failed; continuing without", exc_info=True)
         return settings
+
+
+def _clip_lesson(value, limit: int) -> str:
+    """One lesson field, safe to place inside the data envelope."""
+    text = "".join(ch for ch in str(value or "") if ch in "\n\t" or ch.isprintable())
+    text = text.replace("<lessons-data", "[lessons-data").replace(
+        "</lessons-data", "[/lessons-data"
+    )
+    return text[:limit]
 
 
 IMAGE_MODES = ("structured", "text")
