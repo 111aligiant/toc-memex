@@ -334,7 +334,9 @@ async def test_apply_proposal_applies_an_approved_set_page(tmp_path):
     _seed_ocr_pages(tmp_path)
 
     async with session_factory(engine)() as db:
-        dispatcher = Dispatcher(db, tmp_path, "d1")
+        # allow_approval=True models the human approval surface; the curator
+        # agent loop is refused (it could otherwise self-approve a canary).
+        dispatcher = Dispatcher(db, tmp_path, "d1", allow_approval=True)
         proposed = await dispatcher.dispatch(
             "propose_ops",
             {

@@ -188,6 +188,36 @@ def test_export_csv_flattens(tmp_path):
     assert "15" in lines[1] and "api_usage" in lines[1]
 
 
+def test_export_csv_neutralizes_formula_injection(tmp_path):
+    """S5: a cell starting with = + - @ must not open as a spreadsheet formula.
+
+    Model name / endpoint / error are attacker-influenced; a leading '=' would
+    be evaluated (DDE, HYPERLINK) when the CSV is opened. Each such cell is
+    prefixed with a single quote so the spreadsheet shows it literally.
+    """
+    _seed_log(tmp_path, [
+        {"id": "1", "ts": "2026-11-18T01:00:00+00:00", "call_site": "llm_complete",
+         "endpoint": "=cmd|' /C calc'!A0", "model": "+SUM(A1)", "run_id": "run_a",
+         "doc_id": "d1", "status": "error", "error": "@evil",
+         "tokens": {"prompt": 1, "completion": 0, "total": 1}},
+    ])
+    body, _, _ = llm_log.export_calls(tmp_path, format="csv")
+    import csv as _csv
+    import io as _io
+
+    rows = list(_csv.reader(_io.StringIO(body)))
+    header, data = rows[0], rows[1]
+    cell = dict(zip(header, data))
+    # Every dangerous field is neutralized with a leading apostrophe.
+    assert cell["endpoint"].startswith("'") and "cmd" in cell["endpoint"]
+    assert cell["model"].startswith("'")
+    assert cell["error"].startswith("'")
+    # The leading formula characters no longer start the raw cell.
+    for field in ("endpoint", "model", "error"):
+        assert not cell[field][0] in ("=", "+", "-", "@")
+
+
+
 def test_count_calls_matches_read_calls(tmp_path):
     _seed_log(tmp_path, [
         {"id": str(i), "ts": f"2026-11-18T0{i}:00:00+00:00", "call_site": "llm_complete",

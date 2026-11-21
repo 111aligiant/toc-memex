@@ -640,6 +640,11 @@ async def ask(
     usage-logged like search; the answer carries confirmed errata for the
     cited sections under "errata".
     """
+    # Clamp like search: an unclamped/negative top_k or max_chars would let a
+    # caller pull far more than intended (top_k=-1, max_chars=-1, huge values).
+    top_k = max(1, min(int(top_k or 3), 12))
+    max_chars = max(200, min(int(max_chars or 1200), 20000))
+    collection = str(collection or "")
     async with _session() as db:
         try:
             result = await ask_question(
@@ -1205,6 +1210,10 @@ async def get_page_text(doc_id: str, pages: list[int]) -> dict:
 @server.tool()
 async def get_chunks(doc_id: str, node_id: str = "", limit: int = 100, offset: int = 0) -> dict:
     """Slice list: index, node, pages, char count, 80-char preview."""
+    # Clamp: limit=-1 would return every slice, and a huge limit would too;
+    # offset<0 is meaningless. Keep a sane window like the other list tools.
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
     return await _curation_call(
         doc_id, "get_chunks", {"node_id": node_id, "limit": limit, "offset": offset}
     )

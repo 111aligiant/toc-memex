@@ -26,6 +26,19 @@ _PREVIEW_CHARS = 800
 # whatever the route layer does with encoded separators.
 _CALL_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
+# A spreadsheet treats a cell starting with = + - @ (or the tab/CR variants)
+# as a formula. Model names, endpoints, error strings and run ids are all
+# attacker-influenced, so neutralize them before they land in a CSV cell
+# (CSV formula injection: =HYPERLINK, DDE, etc.).
+_CSV_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Neutralize a value that a spreadsheet would evaluate as a formula."""
+    if isinstance(value, str) and value.startswith(_CSV_INJECTION_PREFIXES):
+        return "'" + value
+    return value
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -448,14 +461,14 @@ def export_calls(
             tokens = record.get("tokens") or {}
             request = record.get("request") or {}
             response = record.get("response") or {}
-            writer.writerow([
+            writer.writerow([_csv_safe(v) for v in [
                 record.get("ts"), record.get("call_site"), record.get("endpoint"),
                 record.get("model"), record.get("run_id"), record.get("doc_id"),
                 record.get("status"), record.get("retries"), record.get("elapsed_ms"),
                 tokens.get("prompt"), tokens.get("completion"), tokens.get("total"),
                 tokens.get("source"), request.get("prompt_chars"),
                 response.get("content_chars"), record.get("error") or "",
-            ])
+            ]])
         return (
             buffer.getvalue(),
             "text/csv",
