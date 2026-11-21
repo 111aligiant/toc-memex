@@ -183,7 +183,7 @@ async def test_inspector_http_endpoints(tmp_path):
         with urllib.request.urlopen(f"{base}/") as response:
             assert response.status == 200
             html = response.read().decode("utf-8")
-            assert "Chunk Inspector" in html
+            assert "Toc Memex Inspector" in html
     finally:
         server.shutdown()
         server.server_close()
