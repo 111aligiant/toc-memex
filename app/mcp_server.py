@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextvars
 import functools
 import time
@@ -216,6 +217,55 @@ def observed(fn):
     return wrapper
 
 
+# ── process-level engine cache ────────────────────────────────────────────
+#
+# Every MCP tool used to call make_engine() + ensure_schema() and then
+# dispose() the engine on the way out. That creates a fresh connection pool
+# and re-runs the whole idempotent migration/backfill sweep (create_all,
+# FTS DDL, several column-ALTER patches) for a single tool call. The web app
+# already keeps one engine for the process lifetime (app.state.search_engine);
+# the MCP server should do the same. One engine per database path, schema
+# ensured once, disposed only at shutdown (or via dispose_cached_engines() in
+# tests). Behaviour is identical — ensure_schema is idempotent and the pool is
+# safe to share across coroutines on one event loop.
+_ENGINE_CACHE: dict[str, "_CachedEngine"] = {}
+_ENGINE_LOCK = asyncio.Lock()
+
+
+@dataclass
+class _CachedEngine:
+    engine: Any
+    schema_ready: bool = False
+
+
+async def _get_cached_engine(db_path: Path) -> "_CachedEngine":
+    key = str(Path(db_path).resolve())
+    async with _ENGINE_LOCK:
+        entry = _ENGINE_CACHE.get(key)
+        if entry is None:
+            entry = _CachedEngine(engine=make_engine(db_path))
+            _ENGINE_CACHE[key] = entry
+        if not entry.schema_ready:
+            await ensure_schema(entry.engine)
+            entry.schema_ready = True
+        return entry
+
+
+async def dispose_cached_engines() -> None:
+    """Drop and dispose every cached engine (process shutdown, or tests).
+
+    Safe to call repeatedly; the next tool call transparently rebuilds.
+    """
+    async with _ENGINE_LOCK:
+        entries = list(_ENGINE_CACHE.values())
+        _ENGINE_CACHE.clear()
+    for entry in entries:
+        try:
+            await entry.engine.dispose()
+        except Exception:
+            pass
+
+
 async def _with_db(
     fn: Callable[[AsyncSession], Awaitable[Any]],
 ) -> Any:
@@ -234,21 +284,17 @@ async def _with_db(
         return result
 
     settings = get_settings()
-    engine = make_engine(settings.tocmemex_db_path)
-    await ensure_schema(engine)
-    try:
-        async with session_factory(engine)() as db:
-            try:
-                result = await fn(db)
-            except _collections.CollectionNotFound as exc:
-                raise ToolError(str(exc)) from exc
-            # Side-effect tools (read_section auto-logging, activity_write)
-            # only flush; without this commit the session close rolls the
-            # writes back and the activity log silently loses rows.
-            await db.commit()
-            return result
-    finally:
-        await engine.dispose()
+    cached = await _get_cached_engine(settings.tocmemex_db_path)
+    async with session_factory(cached.engine)() as db:
+        try:
+            result = await fn(db)
+        except _collections.CollectionNotFound as exc:
+            raise ToolError(str(exc)) from exc
+        # Side-effect tools (read_section auto-logging, activity_write)
+        # only flush; without this commit the session close rolls the
+        # writes back and the activity log silently loses rows.
+        await db.commit()
+        return result
 
 
 async def _safe_rollback(db: AsyncSession) -> None:
@@ -1340,16 +1386,18 @@ class _SessionCtx:
             self._session = bridged.session
             return self._session
         settings = get_settings()
-        self._engine = make_engine(settings.tocmemex_db_path)
-        await ensure_schema(self._engine)
+        # Reuse the process-level engine instead of building and disposing a
+        # pool (plus re-running ensure_schema) on every tool call.
+        self._cached = await _get_cached_engine(settings.tocmemex_db_path)
+        self._engine = self._cached.engine
         self._session = session_factory(self._engine)()
         return self._session
 
     async def __aexit__(self, *exc):
-        if self._engine is None:
+        if getattr(self, "_engine", None) is None:
             return
+        # Close the session but keep the shared engine alive for the next call.
         await self._session.close()
-        await self._engine.dispose()
 
 
 def _session() -> _SessionCtx:
