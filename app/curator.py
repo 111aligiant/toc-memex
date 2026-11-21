@@ -48,6 +48,14 @@ def _print_run(result: dict, as_json: bool) -> None:
                     f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
                 )
             print(f"    {job.get('kind', '?'):16} {state}")
+    for job in result.get("search_jobs") or []:
+        if job.get("pending"):
+            state = "pending human approval"
+        else:
+            state = job.get("skipped") or job.get("error") or (
+                f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
+            )
+        print(f"  [search] {job.get('query', '')[:40]:42} {state}")
     print(f"total applied ops: {result['applied']}; skipped: {result['skipped']}")
     if result.get("timed_out"):
         print("达到墙钟预算，已提前结束；剩余文档留待下一轮。")

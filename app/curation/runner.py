@@ -50,7 +50,16 @@ RULE_KINDS = ("short-chunks", "missing-pages")
 # (they need a page read and an evidence-backed op). Without this the
 # curator never even created a job for 6 duplicate-heading groups and the
 # unplaced-node group that the quality page already reports.
-AGENT_KINDS = ("unplaced", "duplicate-heading")
+#
+# ``zero-result-queries`` does not run in the per-document loop: it is a
+# separate pass driven by the search log (self-evolution §5.4.2), one job per
+# (candidate document, missed query). It rides in AGENT_KINDS so the 编修
+# settings page keeps one list of agent-enabled kinds.
+SEARCH_KINDS = ("zero-result-queries",)
+AGENT_KINDS = ("unplaced", "duplicate-heading", *SEARCH_KINDS)
+# One run may open at most this many zero-hit jobs; the observation window
+# and the proposal page need to keep up with them.
+SEARCH_JOB_LIMIT = 5
 
 
 def _fingerprint(doc: Document, kind: str, params: dict) -> str:
@@ -213,10 +222,16 @@ async def select_documents(db: AsyncSession, data_dir, limit: int = DEFAULT_DOC_
 
 
 async def _ensure_job(
-    db: AsyncSession, doc: Document, kind: str, params: dict, priority: float
+    db: AsyncSession,
+    doc: Document,
+    kind: str,
+    params: dict,
+    priority: float,
+    *,
+    issue_id: str | None = None,
 ) -> CurationJob:
     fingerprint = _fingerprint(doc, kind, params)
-    issue = f"{doc.id}:{kind}"
+    issue = issue_id or f"{doc.id}:{kind}"
     existing = (
         await db.execute(
             select(CurationJob).where(
@@ -540,6 +555,8 @@ async def run_agent(
     max_calls: int | None = None,
     runtime: tuple | None = None,
     verify: bool = True,
+    extra_context: str = "",
+    defer_low_risk: bool = False,
 ) -> dict:
     """The agent loop (P2). Falls back to rules when no LLM is configured.
 
@@ -549,6 +566,9 @@ async def run_agent(
     instead of once per document. ``max_calls`` also comes from the 编修
     settings unless a caller forces it. ``verify`` rides through to the
     dispatcher so every applied op is measured (self-evolution L2).
+    ``extra_context`` carries a job-specific task (the missed query for
+    ``zero-result-queries``); ``defer_low_risk`` makes a new strategy's
+    writes proposal-only until a human approves them (§5.6).
     """
     from ..llm.purpose import resolve_runtime
 
@@ -563,15 +583,18 @@ async def run_agent(
     from ..llm.agent import run_tool_loop
 
     dispatcher = Dispatcher(
-        db, data_dir, doc.id, job_id=job.id, run_id=run_id, verify=verify
+        db, data_dir, doc.id, job_id=job.id, run_id=run_id, verify=verify,
+        defer_low_risk=defer_low_risk,
     )
+    prior = await _prior_context(db, doc, job.kind)
+    context = "\n\n".join(part for part in (prior, extra_context) if part)
     result = await run_tool_loop(
         dispatcher,
         doc,
         max_calls=int(max_calls if max_calls is not None else cfg.get("max_calls", 20)),
         run_id=run_id,
         settings=settings,
-        context=await _prior_context(db, doc, job.kind),
+        context=context,
         system_prompt=(cfg.get("prompts") or {}).get("system_prompt"),
     )
     result["endpoint"] = endpoint
@@ -692,8 +715,15 @@ async def run_once(
 
         summary["settled"] = await settle_outcomes(db, data_dir=data_dir)
         documents = await select_documents(db, data_dir, limit=limit)
+        # Search-quality jobs are not per-document-loop work: they are opened
+        # from the search log after the document pass. Keep them out of the
+        # per-document kinds or every selected document would get an empty
+        # job with no query attached.
+        per_doc_kinds = tuple(
+            kind for kind in enabled_agent_kinds if kind not in SEARCH_KINDS
+        )
         job_kinds = (
-            (*RULE_KINDS, *enabled_agent_kinds) if agent_enabled else RULE_KINDS
+            (*RULE_KINDS, *per_doc_kinds) if agent_enabled else RULE_KINDS
         )
         for doc in documents:
             if time.monotonic() >= deadline:
@@ -745,10 +775,130 @@ async def run_once(
                 await db.commit()
             summary["documents"].append(doc_result)
 
+        # Zero-hit cleanup: map still-zero queries to candidate documents and
+        # let the agent judge whether a keyword is missing. New strategy, so
+        # every write is proposal-only until a human approves it (§5.6).
+        search_kinds = tuple(
+            kind for kind in enabled_agent_kinds if kind in SEARCH_KINDS
+        )
+        if (
+            agent_enabled
+            and search_kinds
+            and time.monotonic() < deadline
+        ):
+            summary["search_jobs"] = await _run_zero_result_jobs(
+                db, data_dir, run_id, runtime, verify=verify, deadline=deadline,
+                summary=summary,
+            )
+
     summary["finished_at"] = utcnow_iso()
     await _write_handoff(db, summary)
     summary["lessons_written"] = await _write_lessons(db, summary)
     return summary
+
+
+def _zero_result_context(pair: dict) -> str:
+    """The task-specific user context for one zero-hit job."""
+    shared = "、".join(pair.get("shared") or []) or "（无）"
+    return (
+        "零命中查询任务（不是文档告警）：\n"
+        f"- 查询：{pair['query']}\n"
+        f"- 近期检索 0 命中，共出现 {pair['misses']} 次\n"
+        f"- 本文档标题/关键词与查询共享：{shared}（覆盖率 {pair['coverage']}）\n"
+        f"- 当前关键词：{pair['keywords'] or '（空）'}\n\n"
+        "请判断本文档是否真的覆盖这个查询所问的概念：看目录、切片，必要时读页。\n"
+        "- 覆盖：用 propose_ops 提交一条 set_keywords，保留现有词并补上缺失的查询词；\n"
+        "- 不覆盖：不要提案，在总结里说明原因。不要为了凑命中堆关键词。\n"
+        "本策略是新的，写入只会成为待批提案，由人审批后才生效。"
+    )
+
+
+async def _run_zero_result_jobs(
+    db: AsyncSession,
+    data_dir,
+    run_id: str,
+    runtime: tuple,
+    *,
+    verify: bool,
+    deadline: float,
+    summary: dict,
+) -> list[dict]:
+    """Open and run zero-hit jobs for this run's best candidate pairs.
+
+    Each job is (candidate document, missed query). Fingerprints carry the
+    query, cooldown is per job (not per kind), and the agent runs with
+    ``defer_low_risk`` so a keyword proposal waits for a human.
+    """
+    from .search_quality import candidate_pairs
+
+    try:
+        pairs = await candidate_pairs(db)
+    except Exception:  # a partial database must not fail the run
+        return []
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=COOLDOWN_DAYS)).isoformat()
+    results: list[dict] = []
+    for pair in pairs[:SEARCH_JOB_LIMIT]:
+        if time.monotonic() >= deadline:
+            summary["timed_out"] = True
+            break
+        doc = await db.get(Document, pair["doc_id"])
+        if doc is None or doc.status != "ready":
+            continue
+        digest = hashlib.sha1(pair["query"].encode("utf-8")).hexdigest()[:12]
+        issue_id = f"{doc.id}:zero-result-queries:{digest}"
+        job = await _ensure_job(
+            db,
+            doc,
+            "zero-result-queries",
+            {"query": pair["query"]},
+            0.0,
+            issue_id=issue_id,
+        )
+        if (
+            job.status in ("applied", "skipped", "rejected", "proposed")
+            and (job.updated_at or "") >= cutoff
+        ):
+            results.append(
+                {
+                    "job_id": job.id,
+                    "kind": job.kind,
+                    "query": pair["query"],
+                    "skipped": f"settled:{job.status}",
+                }
+            )
+            continue
+        job.status = "running"
+        job.attempts += 1
+        job.updated_at = utcnow_iso()
+        await db.flush()
+        try:
+            result = await run_agent(
+                db,
+                doc,
+                data_dir,
+                job,
+                run_id,
+                runtime=runtime,
+                verify=verify,
+                extra_context=_zero_result_context(pair),
+                defer_low_risk=True,
+            )
+        except Exception as exc:  # one job's failure must not stop the run
+            job.status = "failed"
+            job.last_error = f"{type(exc).__name__}: {exc}"
+            job.updated_at = utcnow_iso()
+            await db.flush()
+            result = {"job_id": job.id, "kind": job.kind, "error": job.last_error}
+        result["query"] = pair["query"]
+        result["shared"] = pair.get("shared") or []
+        if result.get("applied"):
+            summary["applied"] += result["applied"]
+        if result.get("pending"):
+            summary["pending"] = summary.get("pending", 0) + result["pending"]
+        results.append(result)
+        await db.commit()
+    return results
 
 
 async def _write_handoff(db: AsyncSession, summary: dict) -> None:
@@ -776,6 +926,13 @@ async def _write_handoff(db: AsyncSession, summary: dict) -> None:
         )
     if summary.get("timed_out"):
         body += "\n注意：达到墙钟预算提前结束，剩余文档留待下一轮。"
+    search_jobs = summary.get("search_jobs") or []
+    if search_jobs:
+        pending = sum(1 for job in search_jobs if job.get("pending"))
+        body += (
+            f"\n零命中查询：本轮处理 {len(search_jobs)} 个候选 job，"
+            f"{pending} 个待批提案。"
+        )
     try:
         db.add(AgentNote(author="curator", kind="handoff", body=body))
         await db.commit()

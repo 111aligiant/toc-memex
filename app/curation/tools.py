@@ -229,6 +229,33 @@ async def list_quality_signals(
     return result
 
 
+async def get_search_signals(
+    db: AsyncSession,
+    data_dir,
+    doc_id: str = "",
+    days: int = 7,
+    **budget,
+) -> dict:
+    """Zero-hit queries that may be about this document, with the shared terms.
+
+    A candidate pair means the query missed and shares at least half (but not
+    all) of its jieba terms with this document's title/keywords. It is a lead,
+    not a verdict: the agent still has to check the TOC, slices or pages
+    before writing ``set_keywords`` (``docs/self-evolution.md`` §5.4.2).
+    """
+    doc = await _document(db, doc_id)
+    from .search_quality import candidate_queries_for_doc
+
+    candidates = await candidate_queries_for_doc(db, doc.id, days=days)
+    return {
+        "doc_id": doc.id,
+        "title": doc.title,
+        "keywords": doc.keywords or "",
+        "candidate_queries": candidates,
+        "budget": _budget(budget.get("calls_left"), budget.get("tokens_left")),
+    }
+
+
 async def get_usage(db: AsyncSession, data_dir, doc_id: str, **budget) -> dict:
     """Usage aggregates for one document: queries, hits, mark_used rate."""
     from sqlalchemy import text as sql_text

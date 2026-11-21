@@ -377,7 +377,12 @@ async def validate_op(ctx: ProposalContext, op: dict) -> tuple[str, str]:
 
 
 async def apply_ops(
-    ctx: ProposalContext, ops: list[dict], proposal_id: str, *, verify: bool = True
+    ctx: ProposalContext,
+    ops: list[dict],
+    proposal_id: str,
+    *,
+    verify: bool = True,
+    defer_low_risk: bool = False,
 ) -> dict:
     """Validate and apply a whole proposal, op by op.
 
@@ -391,6 +396,12 @@ async def apply_ops(
     after the write; a degraded verdict (``verify.compare_metrics``) rolls
     the write back the same way. The comparison rides on the result as
     ``verify`` so the caller can record it and write a negative lesson.
+
+    ``defer_low_risk`` is the canary switch for a new strategy: even ops that
+    would normally apply (``set_keywords`` and friends) become
+    ``pending_human``. The proposal path is unchanged, so ``apply_proposal``
+    can still apply them after a human reads the rationale
+    (``docs/self-evolution.md`` §5.6).
     """
     from .verify import compare_metrics, snapshot_metrics
 
@@ -402,6 +413,11 @@ async def apply_ops(
     validated = []
     for index, op in enumerate(ops):
         status, reason = await validate_op(ctx, op)
+        if defer_low_risk and status == "ok" and op.get("op") != "no_op":
+            status, reason = (
+                "pending",
+                "new strategy: awaiting human approval (canary)",
+            )
         validated.append((index, op, status, reason))
 
     if any(status == "ok" for _, _, status, _ in validated):

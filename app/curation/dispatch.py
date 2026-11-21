@@ -22,6 +22,7 @@ READ_TOOLS = {
     "get_chunks": tools.get_chunks,
     "get_quality": tools.get_quality,
     "list_quality_signals": tools.list_quality_signals,
+    "get_search_signals": tools.get_search_signals,
     "get_usage": tools.get_usage,
     "get_toc_nodes": tools.get_toc_nodes,
     "get_printed_toc_llm": tools.get_printed_toc_llm,
@@ -76,6 +77,7 @@ class Dispatcher:
         run_id: str | None = None,
         budget: Budget | None = None,
         verify: bool = True,
+        defer_low_risk: bool = False,
     ):
         self.db = db
         self.data_dir = data_dir
@@ -85,6 +87,9 @@ class Dispatcher:
         self.budget = budget or Budget()
         # Closed-loop verification rides on every write (self-evolution L2).
         self.verify = verify
+        # New strategies start proposal-only (self-evolution §5.6 canary):
+        # low-risk ops become pending until a human approves.
+        self.defer_low_risk = defer_low_risk
 
     async def dispatch(self, name: str, args: dict | None = None) -> dict:
         args = dict(args or {})
@@ -117,7 +122,10 @@ class Dispatcher:
         proposal_id = new_uuid()
         job_id = await self._ensure_job()
         ctx = await build_context(self.db, doc, self.data_dir)
-        outcome = await apply_ops(ctx, ops, proposal_id, verify=self.verify)
+        outcome = await apply_ops(
+            ctx, ops, proposal_id, verify=self.verify,
+            defer_low_risk=self.defer_low_risk,
+        )
         await self._handle_degraded(outcome, proposal_id, ops)
 
         verdict = "rejected"
@@ -347,6 +355,21 @@ def tool_schemas() -> list[dict]:
                         "days": {"type": "integer", "default": 7},
                         "limit": {"type": "integer", "default": 20},
                     },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_search_signals",
+                "description": (
+                    "Zero-hit queries that share at least half their terms "
+                    "with this document's title/keywords (a lead, not a "
+                    "verdict). Returns current keywords and the shared terms."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"days": {"type": "integer", "default": 7}},
                 },
             },
         },

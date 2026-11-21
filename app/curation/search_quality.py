@@ -33,6 +33,13 @@ MISS_RANK = 0
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_LIMIT = 50
 DEFAULT_TOP_K = 8
+# Candidate mapping for a still-zero query (self-evolution §5.4.2): a document
+# is worth a look when the query and its title/keywords share at least half
+# the query terms — but not ALL of them. All of them means the document
+# fallback already answers the query (``app/index/fts.py``), so no job is
+# needed; none of them means the query says nothing about this document.
+CANDIDATE_MIN_COVERAGE = 0.5
+CANDIDATE_PER_QUERY = 3
 
 
 async def zero_hit_queries(
@@ -132,3 +139,113 @@ async def replay_zero_hits(
         "still_zero": len(queries) - recovered,
         "queries": queries,
     }
+
+
+async def candidate_pairs(
+    db: AsyncSession,
+    *,
+    days: int = DEFAULT_WINDOW_DAYS,
+    miss_limit: int = DEFAULT_LIMIT,
+    per_query: int = CANDIDATE_PER_QUERY,
+) -> list[dict]:
+    """Map still-zero queries to documents worth a curator look.
+
+    The mapping is deliberately shallow and explainable: jieba tokens of the
+    query versus jieba tokens of the document title + keywords. A candidate
+    shares at least half the query terms but not all of them — all of them
+    would already be answered by the document fallback, and fewer than half
+    says the query is not about that document. The returned ``shared`` list
+    is the evidence an agent sees and a human can check.
+
+    A query with a single token is never mapped: a one-token query has no
+    "half", so either the document matches it (fallback answers) or it does
+    not (no basis for a job).
+    """
+    from ..index.fts import seg_query
+
+    misses = await zero_hit_queries(db, days=days, limit=miss_limit)
+    by_query: dict[str, dict] = {}
+    for row in misses:
+        item = by_query.setdefault(
+            row["query"],
+            {"query": row["query"], "misses": 0, "tools": [], "last_seen": row["last_seen"]},
+        )
+        item["misses"] += int(row["misses"])
+        if row["tool"] not in item["tools"]:
+            item["tools"].append(row["tool"])
+        if row["last_seen"] > item["last_seen"]:
+            item["last_seen"] = row["last_seen"]
+    if not by_query:
+        return []
+
+    docs = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, title, keywords FROM documents WHERE status = 'ready'"
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    doc_tokens = {
+        doc["id"]: set(seg_query(f"{doc['title'] or ''} {doc['keywords'] or ''}"))
+        for doc in docs
+    }
+
+    pairs: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for query, item in by_query.items():
+        tokens = set(seg_query(query))
+        if len(tokens) < 2:
+            continue
+        candidates: list[dict] = []
+        for doc in docs:
+            shared = tokens & doc_tokens[doc["id"]]
+            coverage = len(shared) / len(tokens)
+            if not shared or coverage < CANDIDATE_MIN_COVERAGE or coverage >= 1.0:
+                continue
+            candidates.append(
+                {
+                    "doc_id": doc["id"],
+                    "title": doc["title"] or "",
+                    "keywords": doc["keywords"] or "",
+                    "shared": sorted(shared),
+                    "coverage": round(coverage, 2),
+                }
+            )
+        candidates.sort(
+            key=lambda candidate: (
+                -candidate["coverage"],
+                -len(candidate["shared"]),
+                candidate["title"],
+            )
+        )
+        for candidate in candidates[: max(1, per_query)]:
+            key = (candidate["doc_id"], query)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(
+                {
+                    "query": query,
+                    "misses": item["misses"],
+                    "tools": item["tools"],
+                    "last_seen": item["last_seen"],
+                    **candidate,
+                }
+            )
+    return pairs
+
+
+async def candidate_queries_for_doc(
+    db: AsyncSession,
+    doc_id: str,
+    *,
+    days: int = DEFAULT_WINDOW_DAYS,
+    limit: int = CANDIDATE_PER_QUERY,
+) -> list[dict]:
+    """The candidate pairs that point at one document (agent tool helper)."""
+    pairs = await candidate_pairs(db, days=days)
+    return [pair for pair in pairs if pair["doc_id"] == doc_id][: max(1, limit)]

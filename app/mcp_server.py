@@ -1231,6 +1231,15 @@ async def list_quality_signals(days: int = 7, limit: int = 20) -> dict:
 
 
 @server.tool()
+async def get_search_signals(doc_id: str, days: int = 7) -> dict:
+    """Zero-hit queries that may be about this document, with current keywords
+    and the shared terms. A lead for ``set_keywords``, not a verdict."""
+    return await _curation_call(
+        doc_id, "get_search_signals", {"days": days}
+    )
+
+
+@server.tool()
 async def get_usage(doc_id: str) -> dict:
     """Usage aggregates: queries that surfaced this document, mark_used rate."""
     return await _curation_call(doc_id, "get_usage", {})

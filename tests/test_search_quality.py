@@ -11,12 +11,25 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
+from app.curation import tools
 from app.curation import verify as verify_mod
 from app.curation.ops import ProposalContext, apply_ops
-from app.curation.search_quality import replay_zero_hits, zero_hit_queries
+from app.curation.search_quality import (
+    candidate_pairs,
+    candidate_queries_for_doc,
+    replay_zero_hits,
+    zero_hit_queries,
+)
 from app.db import init_db, make_engine, session_factory
 from app.index.activity import UsageLog, usage_log_write
-from app.models import Chunk, Document, Namespace, TocNode
+from app.models import (
+    Chunk,
+    CurationJob,
+    CurationProposal,
+    Document,
+    Namespace,
+    TocNode,
+)
 
 
 async def _seed(tmp_path):
@@ -168,6 +181,161 @@ async def test_set_keywords_makes_a_missed_query_find_the_document(tmp_path):
     assert item["query"] == "低温"
     assert item["recovered"] is True
     assert item["docs"][0]["doc_id"] == "d1"
+    await engine.dispose()
+
+
+# ── candidate mapping and jobs ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_candidate_pairs_need_partial_term_overlap(tmp_path):
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        # Shares 温度 with the title (coverage 0.5) — a lead.
+        await usage_log_write(db, "温度 冲击", "search", [])
+        # Shares all of it — the document fallback already answers it.
+        await usage_log_write(db, "温度试验", "search", [])
+        # Shares nothing with the title.
+        await usage_log_write(db, "量子纠缠", "search", [])
+        await db.commit()
+
+        pairs = await candidate_pairs(db, days=7)
+        for_doc = await candidate_queries_for_doc(db, "d1", days=7)
+    assert len(pairs) == 1
+    assert pairs[0]["query"] == "温度 冲击"
+    assert pairs[0]["doc_id"] == "d1"
+    assert pairs[0]["shared"] == ["温度"]
+    assert pairs[0]["coverage"] == 0.5
+    assert for_doc == pairs
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_reports_search_signals(tmp_path):
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        await usage_log_write(db, "温度 冲击", "search", [])
+        await db.commit()
+        result = await tools.get_search_signals(
+            db, tmp_path, "d1", calls_left=2, tokens_left=50
+        )
+    assert result["keywords"] in (None, "")
+    assert result["candidate_queries"][0]["query"] == "温度 冲击"
+    assert result["budget"] == {"calls_left": 2, "tokens_left": 50}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_defer_low_risk_keeps_keywords_pending(tmp_path):
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        doc = await db.get(Document, "d1")
+        ctx = ProposalContext(db=db, doc=doc, pages={}, data_dir=None)
+        deferred = await apply_ops(
+            ctx,
+            [{"op": "set_keywords", "keywords": "低温"}],
+            "proposal-defer",
+            defer_low_risk=True,
+        )
+        await db.commit()
+        assert deferred["applied_ops"] == 0
+        assert deferred["pending_ops"] == 1
+        assert deferred["results"][0]["gate"] == "pending_human"
+        assert (await db.get(Document, "d1")).keywords in (None, "")
+
+        # The human approval path (defer off) is unchanged.
+        applied = await apply_ops(
+            ctx, [{"op": "set_keywords", "keywords": "低温"}], "proposal-apply"
+        )
+        await db.commit()
+        assert applied["applied_ops"] == 1
+        assert (await db.get(Document, "d1")).keywords == "低温"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_zero_result_job_files_a_pending_keyword_proposal(tmp_path, monkeypatch):
+    """The full loop: miss -> candidate job -> proposal -> human approve -> replay."""
+    import json
+    import time
+
+    from app.curation import runner
+    from app.curation.dispatch import Dispatcher
+    from app.index.fts import search_chunks
+    from app.llm.client import ChatReply
+
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        await usage_log_write(db, "温度 冲击", "search", [])
+        await db.commit()
+
+        script = [
+            ChatReply(
+                content=None,
+                tool_calls=[
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "propose_ops",
+                            "arguments": json.dumps(
+                                {
+                                    "ops": [
+                                        {"op": "set_keywords", "keywords": "温度 冲击"}
+                                    ],
+                                    "rationale": "文档覆盖温度试验",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+                tokens={"prompt": 1, "completion": 1, "total": 2, "source": "api_usage"},
+            ),
+            ChatReply(
+                content="已提案",
+                tool_calls=[],
+                tokens={"prompt": 1, "completion": 1, "total": 2, "source": "api_usage"},
+            ),
+        ]
+        calls = {"n": 0}
+
+        def fake_chat(messages, settings=None, **kwargs):
+            reply = script[min(calls["n"], len(script) - 1)]
+            calls["n"] += 1
+            return reply
+
+        monkeypatch.setattr("app.llm.agent.llm_chat", fake_chat)
+        summary = {"applied": 0, "skipped": 0}
+        results = await runner._run_zero_result_jobs(
+            db,
+            tmp_path,
+            "run_zr",
+            (object(), "endpoint", {"max_calls": 5}),
+            verify=True,
+            deadline=time.monotonic() + 60,
+            summary=summary,
+        )
+        assert results[0]["query"] == "温度 冲击"
+        assert results[0]["pending"] == 1
+
+        job = (await db.execute(select(CurationJob))).scalars().one()
+        assert job.kind == "zero-result-queries"
+        assert job.status == "proposed"
+        proposal = (await db.execute(select(CurationProposal))).scalars().one()
+        assert proposal.verdict == "pending"
+        assert (await db.get(Document, "d1")).keywords in (None, "")
+
+        # A human approves; only then do the keywords change and the miss clear.
+        dispatcher = Dispatcher(db, tmp_path, "d1")
+        approval = await dispatcher.apply_proposal(proposal.id)
+        await db.commit()
+        assert approval["applied"] == 1
+        assert (await db.get(Document, "d1")).keywords == "温度 冲击"
+        hits = await search_chunks(db, "温度 冲击", top_k=8)
+        assert hits and hits[0]["doc_id"] == "d1"
+        report = await replay_zero_hits(db, days=7)
+    assert report["recovered"] == 1
     await engine.dispose()
 
 

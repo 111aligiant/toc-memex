@@ -50,7 +50,11 @@ def test_defaults_carry_the_shipped_prompts():
 
     bianxiu = bianxiu_defaults()
     assert "{doc_id}" in bianxiu["prompts"]["system_prompt"]
-    assert bianxiu["agent_kinds"] == ["unplaced", "duplicate-heading"]
+    assert bianxiu["agent_kinds"] == [
+        "unplaced",
+        "duplicate-heading",
+        "zero-result-queries",
+    ]
 
 
 def test_validate_drops_unknown_keys_and_clamps():
