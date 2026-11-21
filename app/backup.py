@@ -55,6 +55,15 @@ def backup_data_dir(data_dir: Path, *, keep: int = 3) -> Path | None:
     backups_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     archive = backups_dir / f"tocmemex-{stamp}.zip"
+    # ``datetime.now()`` on Windows has ~10ms resolution, so two backups in the
+    # same tick get the same microsecond stamp and the second silently reuses
+    # (overwrites) the first archive. Add a counter suffix until the name is
+    # free, so every call returns a distinct file even under a coarse clock.
+    if archive.exists():
+        n = 1
+        while (candidate := backups_dir / f"tocmemex-{stamp}-{n}.zip").exists():
+            n += 1
+        archive = candidate
 
     with tempfile.TemporaryDirectory(prefix="tocmemex-backup-") as temp:
         snapshot = Path(temp) / "tocmemex.db"
