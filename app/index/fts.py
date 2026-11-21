@@ -87,15 +87,28 @@ def count_tokens(value: str) -> int:
     return len(jieba.lcut(value or ""))
 
 
+def _is_cjk(ch: str) -> bool:
+    """True for a single CJK ideograph (Han block)."""
+    return (
+        len(ch) == 1
+        and "\u4e00" <= ch <= "\u9fff"
+    )
+
+
 def seg_query(value: str) -> list[str]:
     words = jieba.lcut(value or "")
-    return [
-        word.strip()
-        for word in words
-        if len(word.strip()) >= 2
-        and word.strip() not in STOP_WORDS
-        and not word.strip().isspace()
-    ]
+    kept: list[str] = []
+    for word in words:
+        token = word.strip()
+        if not token or token in STOP_WORDS or token.isspace():
+            continue
+        # Keep multi-character tokens as before. Also keep single-character
+        # CJK ideographs: in Chinese a lone character is a real query
+        # ("泵", "阀", "水") and dropping it made such searches return
+        # nothing (B7). Single ASCII/digit tokens stay filtered as noise.
+        if len(token) >= 2 or _is_cjk(token):
+            kept.append(token)
+    return kept
 
 
 def _quote(term: str) -> str:
@@ -159,7 +172,16 @@ def _build_match(query: str, drop_identifiers: bool = False) -> str:
             terms.append(_quote(ident))
     words = _expand_synonyms(seg_query(query))
     for word in words:
-        terms.append(_quote(word))
+        # A synonym is often a multi-word phrase ("锂离子电池组"). The index
+        # is built with ``seg_index`` (lcut_for_search), which splits such a
+        # phrase into adjacent subwords, so quoting the whole phrase as a
+        # single FTS phrase never matches (B4). Segment the expansion the
+        # same way the index is segmented and OR the resulting tokens, so a
+        # synonym contributes its real tokens instead of an unmatchable
+        # phrase. Single-token terms are unaffected (one token in, one out).
+        part_tokens = [tok for tok in seg_index(word).split() if tok]
+        for token in part_tokens or [word]:
+            terms.append(_quote(token))
     return " OR ".join(dict.fromkeys(terms))
 
 
@@ -483,7 +505,22 @@ async def _search_chunks(
         return await _doc_fallback_hits(db, routed_doc_ids, top_k)
     if not merged and not identifier_routed and IDENT_RE.fullmatch(query.strip()):
         return await _like_search(db, query, top_k, routed_doc_ids)
+    # Single-character CJK queries cannot match FTS: the character is a
+    # subword inside a longer indexed token ("泵" lives inside the token
+    # "水泵"), and FTS matches whole tokens, so the MATCH returns nothing.
+    # Fall back to a substring LIKE so such searches still have recall (B7).
+    if not merged and not identifier_routed and _is_short_cjk_query(query):
+        return await _like_search(db, query, top_k, routed_doc_ids)
     return merged
+
+
+def _is_short_cjk_query(query: str) -> bool:
+    """True when the query is one or two CJK ideographs (a LIKE-only case)."""
+    stripped = (query or "").strip()
+    return (
+        1 <= len(stripped) <= 2
+        and all(_is_cjk(ch) for ch in stripped)
+    )
 
 
 async def _doc_fallback_hits(

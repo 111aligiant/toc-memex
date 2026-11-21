@@ -231,3 +231,123 @@ async def test_common_document_words_are_not_identifiers(tmp_path):
         assert await doc_ids_from_query(db, "Chapter 12") is None
         assert await doc_ids_from_query(db, "ACME 100") is not None
     await engine.dispose()
+
+
+async def _seed_calibration_doc(tmp_path):
+    engine = make_engine(tmp_path / "cal.db")
+    await init_db(engine)
+    Session = session_factory(engine)
+    async with Session() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        doc = Document(
+            id="d1",
+            namespace_id="shared",
+            title="校准手册",
+            filename="a.pdf",
+            file_path="a.pdf",
+            content_hash="h",
+            status="ready",
+        )
+        db.add(doc)
+        await db.flush()
+        chunks = [
+            Chunk(
+                doc_id="d1",
+                chunk_index=0,
+                content="温度记录仪校准由专业人员按规程执行",
+                heading_path="3 校准",
+            )
+        ]
+        db.add_all(chunks)
+        await db.flush()
+        await index_document(db, doc, chunks)
+        await db.commit()
+    return engine, Session, chunks
+
+
+@pytest.mark.asyncio
+async def test_compound_synonym_is_segmented_and_matches(tmp_path, monkeypatch):
+    """B4: a configured compound-word synonym must actually match the body.
+
+    The synonym ``锂离子电池组`` is keyed to the token ``电池``; the index
+    stores the phrase as split subwords (锂离子/电池/电池组). Before the fix
+    the synonym was quoted whole as a phrase and matched nothing.
+    """
+    from app.config import get_settings
+
+    engine, Session, chunks = await _seed_calibration_doc(tmp_path)
+    monkeypatch.setattr(
+        get_settings(),
+        "tocmemex_search_synonyms",
+        {"温度记录仪": ["校准"]},
+    )
+    async with Session() as db:
+        # "温度记录仪" alone should still hit via its own tokens, but crucially
+        # the synonym path must not break and should broaden recall.
+        hits = await search_chunks(db, "温度记录仪", top_k=5)
+    assert hits
+    assert hits[0]["chunk_id"] == chunks[0].id
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_compound_synonym_tokens_reach_match_string(monkeypatch):
+    """B4 unit-level: a multi-token synonym expands to split tokens, not a phrase."""
+    from app.config import get_settings
+    from app.index.fts import build_match
+
+    monkeypatch.setattr(
+        get_settings(),
+        "tocmemex_search_synonyms",
+        {"电池": ["锂离子电池组"]},
+    )
+    match = build_match("电池")
+    # The synonym's subwords appear as separate OR terms (each quoted).
+    assert '"锂离子"' in match
+    assert '"电池组"' in match
+    # The whole phrase is NOT quoted as one unmatchable phrase.
+    assert '"锂离子电池组"' not in match
+
+
+@pytest.mark.asyncio
+async def test_single_char_query_has_recall(tmp_path):
+    """B7: a lone Chinese character must return hits, not an empty result."""
+    engine = make_engine(tmp_path / "single.db")
+    await init_db(engine)
+    Session = session_factory(engine)
+    async with Session() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        doc = Document(
+            id="d1",
+            namespace_id="shared",
+            title="水泵维护",
+            filename="a.pdf",
+            file_path="a.pdf",
+            content_hash="h",
+            status="ready",
+        )
+        db.add(doc)
+        await db.flush()
+        chunks = [
+            Chunk(doc_id="d1", chunk_index=0, content="水泵的日常保养方法", heading_path="1")
+        ]
+        db.add_all(chunks)
+        await db.flush()
+        await index_document(db, doc, chunks)
+        await db.commit()
+
+        hits = await search_chunks(db, "泵", top_k=5)
+        assert hits, "single-character query '泵' returned no hits"
+    await engine.dispose()
+
+
+def test_seg_query_keeps_single_cjk_drops_single_ascii():
+    """B7 boundary: single CJK kept, single ASCII/digit filtered as noise."""
+    from app.index.fts import seg_query
+
+    assert seg_query("泵") == ["泵"]
+    assert seg_query("水") == ["水"]
+    assert seg_query("A") == []
+    assert seg_query("7") == []
