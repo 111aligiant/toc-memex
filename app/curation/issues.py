@@ -43,7 +43,20 @@ def quality_groups(db_path: Path, data_dir: Path | None) -> list[dict]:
     documents = doc_summaries(db_path, data_dir)
     groups: list[dict] = []
     for doc in documents:
-        stats = compute_doc_stats(db_path, doc_row(db_path, doc["id"]), data_dir)
+        # doc_summaries already computed and memoized this document's stats
+        # under a key built from the same fields the summary carries, so we
+        # can hit the cache directly instead of re-querying doc_row per doc.
+        # page_count is not part of the key but *is* part of the computation;
+        # compute_doc_stats only uses doc_row for the key, so a summary-only
+        # row (id + page_count) with the prebuilt key is enough.
+        stats = compute_doc_stats(
+            db_path,
+            {"id": doc["id"], "page_count": doc["pages"]},
+            data_dir,
+            stats_key=_stats_key(
+                db_path, doc["id"], doc["updatedAt"], doc["nodes"], doc["chunks"]
+            ),
+        )
         if doc["status"] == "failed":
             groups.append(
                 {
@@ -191,20 +204,38 @@ def invalidate_stats_cache() -> None:
     _stats_cache.clear()
 
 
+def _stats_key(
+    db_path: Path, doc_id: str, updated_at, node_count, chunk_count
+) -> tuple:
+    """Cache key for per-document stats: everything that can change them."""
+    return (doc_id, updated_at, node_count, chunk_count, str(db_path))
+
+
 def compute_doc_stats(
-    db_path: Path, doc_row: sqlite3.Row, data_dir: Path | None
+    db_path: Path,
+    doc_row: sqlite3.Row,
+    data_dir: Path | None,
+    *,
+    stats_key: tuple | None = None,
 ) -> dict:
     """Coverage / issue stats for one document, mirroring the prototype's
     quality model: covered, contentPages, nonContent, errors, warnings and
-    the six per-document checks."""
+    the six per-document checks.
+
+    ``stats_key`` lets a caller that already knows the document's
+    ``updated_at``/``node_count``/``chunk_count`` (e.g. ``quality_groups``,
+    which has them from ``doc_summaries``) reuse the memoized entry instead
+    of paying for a ``doc_row`` query just to rebuild the key. When omitted
+    the key is derived from ``doc_row`` as before.
+    """
     doc_id = doc_row["id"]
     page_count = doc_row["page_count"] or 0
-    key = (
+    key = stats_key or _stats_key(
+        db_path,
         doc_id,
         doc_row["updated_at"],
         doc_row["node_count"],
         doc_row["chunk_count"],
-        str(db_path),
     )
     cached = _stats_cache.get(key)
     if cached is not None:
