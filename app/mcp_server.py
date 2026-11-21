@@ -803,6 +803,7 @@ async def lesson_write(
     keywords: str = "",
     task_id: str = "",
     doc_id: str = "",
+    ctx: Context | None = None,
 ) -> dict:
     """Record a structured lesson learned so other agents don't repeat it.
     trigger: when does this apply (task/document type/section type);
@@ -815,6 +816,7 @@ async def lesson_write(
             keywords=keywords or None,
             task_id=task_id or None,
             doc_id=doc_id or None,
+            author_session=_log_session_id(ctx),
         )
         await db.commit()
         return _activity.lesson_out(lesson)
@@ -991,8 +993,15 @@ async def task_timeline(task_id: str, limit: int = 200) -> dict:
 
 
 @server.tool()
-async def delete_note(note_id: int, author: str) -> dict:
-    """Delete your own note (author must match).
+async def delete_note(
+    note_id: int, author: str, ctx: Context | None = None
+) -> dict:
+    """Delete your own note.
+
+    Ownership is proven by the server-assigned session that wrote the note,
+    not by the self-reported ``author`` name (which any client can claim).
+    The ``author`` argument is kept for backwards compatibility and is only
+    consulted for legacy notes that predate session stamping.
 
     入库备注 (kind="ingest") is human-owned and cannot be deleted by agents.
     """
@@ -1004,9 +1013,16 @@ async def delete_note(note_id: int, author: str) -> dict:
             return {"deleted": 0}
         if row.kind == "ingest":
             raise ToolError("入库备注由人类维护，agent 不能删除")
+        caller_session = _log_session_id(ctx)
+        if row.session_id:
+            # Note carries a server-assigned session: only that session owns it.
+            if caller_session is None or caller_session != row.session_id:
+                raise ToolError("只能删除本连接（同一 session）写入的备注")
+        elif row.author != author:
+            # Legacy note without a session: fall back to the old name check.
+            raise ToolError("只能删除自己写的备注（author 不匹配）")
         result = await db.execute(
-            delete(AgentNote)
-            .where(AgentNote.id == note_id, AgentNote.author == author)
+            delete(AgentNote).where(AgentNote.id == note_id)
         )
         await db.commit()
         return {"deleted": result.rowcount}
@@ -1084,6 +1100,7 @@ async def activity_write(
     scope: str = "error",
     supersedes_doc_id: str = "",
     supersedes_node_id: str = "",
+    ctx: Context | None = None,
 ) -> dict:
     """Append an activity to the shared log. kind:
     - "cite": you used a section in your answer (anchor doc/node);
@@ -1112,7 +1129,10 @@ async def activity_write(
             doc_id=doc_id or None,
             node_id=node_id or None,
             chunk_id=chunk_id,
-            session_id=session_id or None,
+            # Never trust the caller's session_id: it is an identity claim and
+            # would let one agent forge another connection's rows. Stamp the
+            # server-assigned id for this MCP connection instead (S4).
+            session_id=_log_session_id(ctx),
             reply_to=reply_to,
             scope=scope,
             supersedes_doc_id=supersedes_doc_id or None,
@@ -1121,8 +1141,12 @@ async def activity_write(
         erratum_result = None
         if kind == "review" and accepts is not None and reply_to is not None:
             try:
+                # Two-party gate keyed on the server-assigned session, not the
+                # self-reported name: an agent cannot confirm its own erratum
+                # by simply declaring a different actor_agent (S4).
                 erratum = await _activity.confirm_erratum(
-                    db, reply_to, actor_agent, accepts
+                    db, reply_to, actor_agent, accepts,
+                    reviewer_session=_log_session_id(ctx),
                 )
             except ValueError as exc:
                 await db.rollback()

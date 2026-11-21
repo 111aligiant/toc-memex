@@ -603,6 +603,8 @@ async def confirm_erratum(
     activity_id: int,
     confirmed_by: str,
     accepted: bool,
+    *,
+    reviewer_session: str | None = None,
 ) -> Erratum | None:
     """Promote/demote the erratum referenced by a 'review' activity.
 
@@ -611,7 +613,11 @@ async def confirm_erratum(
 
     Two-party gate enforced in code: the reviewer must differ from the
     proposer, otherwise one compromised/buggy agent can confirm its own
-    fabricated correction and inject it into everyone's retrieval.
+    fabricated correction and inject it into everyone's retrieval. The gate
+    keys on the server-assigned ``session_id`` when both sides carry one,
+    because the self-reported ``actor_agent`` name is trivially spoofable
+    (an agent can declare a different name and approve its own erratum). It
+    falls back to comparing names only for legacy rows with no session.
     """
     from sqlalchemy import select as _select
 
@@ -621,7 +627,17 @@ async def confirm_erratum(
     original = await db.get(Activity, review.reply_to)
     if original is None or original.kind != "erratum":
         return None
-    if confirmed_by == original.actor_agent:
+
+    # Prefer the unforgeable session identity over the self-reported name.
+    proposer_session = original.session_id
+    effective_reviewer_session = reviewer_session or review.session_id
+    if proposer_session and effective_reviewer_session:
+        if proposer_session == effective_reviewer_session:
+            raise ValueError(
+                "self-confirmation forbidden: the reviewer's session matches "
+                "the erratum proposer's session"
+            )
+    elif confirmed_by == original.actor_agent:
         raise ValueError(
             "self-confirmation forbidden: the reviewer must differ from "
             f"the erratum proposer ({original.actor_agent})"
@@ -887,6 +903,10 @@ class Lesson(Base):
     )
     doc_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     support_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # JSON array of session ids that contributed to this lesson. Used so one
+    # connection cannot inflate support_count by resubmitting the same lesson
+    # (S4). Nullable: rows written before this column have no history.
+    contributor_sessions: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)
     updated_at: Mapped[str] = mapped_column(
         String(40), nullable=False, default=utcnow_iso, onupdate=utcnow_iso
@@ -936,6 +956,7 @@ async def lesson_write(
     keywords: str | None = None,
     task_id: str | None = None,
     doc_id: str | None = None,
+    author_session: str | None = None,
 ) -> Lesson:
     """Record a lesson, consolidating with an existing identical one.
 
@@ -943,7 +964,15 @@ async def lesson_write(
     and refreshes the solution instead of inserting a duplicate row. The
     table then reflects "how often this bit us", which is what makes a
     lesson rank above a one-off remark.
+
+    ``author_session`` is the server-assigned connection id. One connection
+    may contribute to a given lesson only once: a repeat submission from the
+    same session neither bumps ``support_count`` nor overwrites the solution
+    text, so an agent cannot inflate a lesson's rank (or clobber another
+    agent's fix) by resubmitting it (S4).
     """
+    import json as _json
+
     if not trigger.strip() or not issue.strip() or not solution.strip():
         raise ValueError("trigger, issue and solution are required")
     if not author_agent:
@@ -958,12 +987,28 @@ async def lesson_write(
             existing = candidate
             break
     if existing is not None:
+        try:
+            contributors = (
+                _json.loads(existing.contributor_sessions)
+                if existing.contributor_sessions
+                else []
+            )
+        except (ValueError, TypeError):
+            contributors = []
+        if not isinstance(contributors, list):
+            contributors = []
+        if author_session and author_session in contributors:
+            # Same connection again: no rank inflation, no solution overwrite.
+            return existing
         existing.support_count = (existing.support_count or 1) + 1
         existing.solution = solution.strip()
         if keywords:
             existing.keywords = keywords
         if doc_id:
             existing.doc_id = doc_id
+        if author_session:
+            contributors.append(author_session)
+            existing.contributor_sessions = _json.dumps(contributors)
         existing.updated_at = utcnow_iso()
         await db.flush()
         return existing
@@ -977,6 +1022,9 @@ async def lesson_write(
         task_id=task_id,
         doc_id=doc_id,
         support_count=1,
+        contributor_sessions=(
+            _json.dumps([author_session]) if author_session else None
+        ),
     )
     db.add(lesson)
     await db.flush()

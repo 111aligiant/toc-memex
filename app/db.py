@@ -212,6 +212,10 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
         await conn.execute(
             text("UPDATE lessons SET updated_at = created_at WHERE updated_at IS NULL")
         )
+    # lessons.contributor_sessions: JSON array of the server-assigned sessions
+    # that have contributed to this lesson, so one connection cannot inflate
+    # support_count by re-submitting the same lesson (S4).
+    await _add_column_if_missing(conn, "lessons", "contributor_sessions", "TEXT")
 
     # curation_outcomes: closed-loop verification state (self-evolution L2).
     # verify_json holds the before/after verifier metrics of one write;
