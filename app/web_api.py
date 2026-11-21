@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 
 _MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 _UPLOAD_STATUSES = ("queued", "indexing", "ready", "duplicate", "failed")
+# A child ingest that never returns would otherwise leave the upload record
+# stuck at "indexing" forever and leak the child process. Cap the wait so a
+# hung parse (deadlocked pypdfium2, an OCR endpoint that never answers, a
+# runaway loop) becomes a recoverable "failed" the user can re-upload.
+_INGEST_TIMEOUT_S = 30 * 60
 
 
 def _stream_digest(path: Path) -> str:
@@ -72,6 +77,41 @@ def _stream_digest(path: Path) -> str:
         for piece in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(piece)
     return digest.hexdigest()
+
+
+async def _communicate_with_timeout(process) -> tuple[bytes, bytes]:
+    """``await process.communicate()`` that cannot hang the upload forever.
+
+    A child ingest that never exits (deadlocked parser, an OCR endpoint that
+    stops answering mid-parse, a runaway loop) would otherwise keep the upload
+    record at "indexing" indefinitely and leak the child. We wait up to
+    ``_INGEST_TIMEOUT_S``; on timeout we kill the child and raise so the
+    caller's ``except`` marks the record "failed" (a recoverable state — the
+    user can re-upload). Cancellation (server shutdown or task cancel) also
+    kills the child before propagating so no orphan process is left behind.
+    """
+    try:
+        return await asyncio.wait_for(
+            process.communicate(), timeout=_INGEST_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        try:
+            await process.communicate()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"解析超时（超过 {_INGEST_TIMEOUT_S // 60} 分钟未完成）。"
+            "文件可能损坏或 OCR 服务无响应；请点「重新上传」重试，"
+            "或到「设置 → OCR 端点」点「测试」确认服务可用。"
+        )
+    except asyncio.CancelledError:
+        process.kill()
+        try:
+            await process.communicate()
+        except Exception:
+            pass
+        raise
 
 
 _IMAGE_PREFIXES = (
@@ -1063,7 +1103,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await _communicate_with_timeout(process)
             if process.returncode != 0:
                 detail = (stderr or stdout).decode("utf-8", "replace").strip()
                 logger.warning("ingest failed for %s: %s", path, detail[-1200:])
