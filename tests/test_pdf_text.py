@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from app.ingest.pdf_text import _text_heading, _toc_pages, text_layer_is_usable
+from app.ingest.pdf_text import (
+    _digit_signal_broken,
+    _text_heading,
+    _toc_pages,
+    text_layer_is_usable,
+)
 from app.ocr.models import OcrBlock, OcrPage
 
 
@@ -97,3 +102,29 @@ def test_toc_page_detection():
         {},
     )
     assert _toc_pages([toc_page, body_page]) == {0}
+
+
+# ── broken-layer digit signal ──────────────────────────────────────────
+
+
+def test_digit_signal_flags_cjk_text_with_symbols_but_no_digits():
+    """A broken CID mapping keeps ℃/% but swallows every digit."""
+    broken = (
+        "本文首先创新性地用硝酸铝替代铝醇盐作为铝源，采用水解溶胶一凝胶法制备"
+        "钛酸铝薄膜。在国际上首次采用非水解溶胶一凝胶法制备钛酸铝薄膜，优化了"
+        "镀膜工艺，热处理温度为 ℃，保温时间为 ，升温速率为 ℃ 。℃ ℃ ℃ ％ ％"
+    )
+    assert _digit_signal_broken(broken) is True
+
+
+def test_digit_signal_passes_normal_technical_text():
+    normal = (
+        "热处理温度为1300℃，保温2h，升温速率8℃/min，致密度达到98.5％，"
+        "维氏硬度和抗弯强度分别为1040HV0.3和277.41MPa。％ ± ×"
+    )
+    assert _digit_signal_broken(normal) is False
+
+
+def test_digit_signal_ignores_non_cjk_text():
+    latin = "The sample was heated at 25 ± 0.5 C with %RH symbols only ± × % ° °"
+    assert _digit_signal_broken(latin) is False

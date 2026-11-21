@@ -38,12 +38,40 @@ def _meaningful_ratio(text: str) -> float:
     return ok / len(text)
 
 
+# Unit and math symbols that only make sense next to a number. A CJK text
+# layer full of them but without any digit has lost its digit glyphs — the
+# signature of a broken CID/ToUnicode mapping (every "1300 ℃" becomes
+# "高熔点 ℃").
+_MEASURE_SYMBOLS = ("℃", "℉", "％", "%", "±", "×", "÷", "μ", "µ", "Ω", "°", "‰")
+_PUA_OR_REPLACEMENT = re.compile(r"[-�]")
+_DIGITS = set("0123456789０１２３４５６７８９")
+
+
+def _digit_signal_broken(text: str) -> bool:
+    """True when the layer kept measurement symbols but dropped every digit.
+
+    A valid text layer for a technical document always carries digits next
+    to ℃/%/±; their total absence means the font's character mapping is
+    broken and the surviving CJK is unreliable (wrong near-homoglyphs).
+    """
+    cjk = sum(1 for char in text if "一" <= char <= "鿿")
+    if cjk / max(len(text), 1) < 0.30:
+        return False  # only meaningful for CJK-dominant documents
+    symbols = sum(text.count(symbol) for symbol in _MEASURE_SYMBOLS)
+    if symbols < 3:
+        return False
+    digits = sum(1 for char in text if char in _DIGITS)
+    return digits <= 2
+
+
 def text_layer_is_usable(doc) -> bool:
     """Reject scanned PDFs and PDFs with broken CID/font encodings.
 
     Broken text layers still return characters, but many are C1 controls or
     Latin-1 mojibake; meaningful-ratio and CJK/ASCII checks separate those
-    from real text layers.
+    from real text layers. Mappings that survive those checks can still be
+    wrong — near-homoglyph CJK with every digit swallowed — so the digit
+    signal and private-use/replacement characters catch the rest.
     """
     sample = min(_SAMPLE_PAGES, len(doc))
     text = "".join(
@@ -52,6 +80,10 @@ def text_layer_is_usable(doc) -> bool:
     if len(text) < max(200, sample * _MIN_CHARS_PER_PAGE):
         return False
     if _meaningful_ratio(text) < _MIN_MEANINGFUL_RATIO:
+        return False
+    if _PUA_OR_REPLACEMENT.search(text):
+        return False
+    if _digit_signal_broken(text):
         return False
     cjk = sum(1 for char in text if "一" <= char <= "鿿")
     ascii_letters = sum(1 for char in text if char.isascii() and char.isalpha())
