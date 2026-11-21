@@ -17,6 +17,7 @@ from app.inspector import (
     page_payload,
 )
 from app.models import Chunk, Document, Namespace, TocNode
+from app.paths import is_safe_doc_id
 
 FIXTURE = Path(__file__).parent / "fixtures" / "paddleocr_sample.jsonl"
 
@@ -188,3 +189,51 @@ async def test_inspector_http_endpoints(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+# ── S3: doc_id path traversal must be refused ────────────────────────────
+
+
+def _plant_victim(tmp_path: Path) -> Path:
+    """Write a secret pages.json OUTSIDE the data dir, one level up."""
+    victim_dir = tmp_path.parent / "secret_ocr" / "victim"
+    victim_dir.mkdir(parents=True, exist_ok=True)
+    (victim_dir / "pages.json").write_text(
+        json.dumps({"pages": [{"page_index": 0, "blocks": [{"label": "text", "content": "SECRET"}]}]}),
+        encoding="utf-8",
+    )
+    return victim_dir
+
+
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "..\\..\\secret_ocr\\victim",   # backslash traversal (Windows separator)
+        "../secret_ocr/victim",         # forward-slash traversal
+        "..",                           # bare parent hop
+        "doc1/../..",                   # nested
+        "CON",                          # reserved device name
+    ],
+)
+def test_page_payload_refuses_traversal_doc_ids(tmp_path, evil):
+    _plant_victim(tmp_path)
+    db_path = tmp_path / "tocmemex.db"  # need not even exist: guard fires first
+    assert page_payload(db_path, evil, 0, tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "evil",
+    ["..\\..\\secret_ocr\\victim", "../secret_ocr/victim", ".."],
+)
+def test_document_payload_refuses_traversal_doc_ids(tmp_path, evil):
+    db_path = tmp_path / "tocmemex.db"
+    assert document_payload(db_path, evil, tmp_path) is None
+
+
+def test_safe_doc_id_accepts_real_ids():
+    # A UUID-shaped id and a short slug must still pass.
+    assert is_safe_doc_id("3f8a1e42-9f0b-4c2d-8e1a-1234567890ab")
+    assert is_safe_doc_id("doc1")
+    assert not is_safe_doc_id("")
+    assert not is_safe_doc_id("a/b")
+    assert not is_safe_doc_id("a\\b")

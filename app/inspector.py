@@ -25,6 +25,7 @@ from .ingest.printed_toc import toc_page_indices
 from .ingest.toc import validate_toc
 from .ocr.cache import OcrCacheError, load_cached_pages
 from .ocr.parser import page_text
+from .paths import is_safe_doc_id
 
 STATIC_DIR = Path(__file__).resolve().parent / "inspector_ui"
 STATIC_TYPES = {
@@ -93,6 +94,8 @@ def _non_content_pages(
 def document_payload(
     db_path: Path, doc_id: str, data_dir: Path | None = None
 ) -> dict | None:
+    if not is_safe_doc_id(doc_id):
+        return None
     with closing(_connect(db_path)) as connection:
         doc_row = connection.execute(
             "SELECT * FROM documents WHERE id = ?", (doc_id,)
@@ -226,6 +229,8 @@ def document_payload(
 def page_payload(
     db_path: Path, doc_id: str, page: int, data_dir: Path | None = None
 ) -> dict | None:
+    if not is_safe_doc_id(doc_id):
+        return None
     directory = data_dir or db_path.parent
     try:
         pages = load_cached_pages(directory / "ocr" / doc_id)

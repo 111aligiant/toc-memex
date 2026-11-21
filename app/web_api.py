@@ -57,6 +57,7 @@ from .models import AgentNote, Document, ModelEndpoint, OcrEndpoint, TocBenchRun
 from .ocr.endpoints import ocr_endpoint_out
 from .ocr.cache import OcrCacheError, load_cached_pages
 from .ocr.parser import page_text
+from .paths import is_safe_doc_id
 
 
 logger = logging.getLogger(__name__)
@@ -480,6 +481,8 @@ def _non_content_pages(
 def _page_payload(
     db_path: Path, doc_id: str, page: int, data_dir: Path | None
 ) -> dict | None:
+    if not is_safe_doc_id(doc_id):
+        return None
     directory = data_dir or db_path.parent
     try:
         pages = load_cached_pages(directory / "ocr" / doc_id)

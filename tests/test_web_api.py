@@ -553,6 +553,26 @@ async def test_api_page_endpoint(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_page_rejects_backslash_traversal(tmp_path):
+    # S3: %5C decodes to a Windows path separator; a doc_id of
+    # '..\..\secret' must not escape the data dir. The page endpoint returns
+    # 404 (payload is None) instead of reading the outside file.
+    await seed_database(tmp_path)
+    victim = tmp_path.parent / "secret_ocr2" / "victim"
+    victim.mkdir(parents=True, exist_ok=True)
+    (victim / "pages.json").write_text(
+        '{"pages": [{"page_index": 0, "blocks": [{"label": "text", "content": "SECRET"}]}]}',
+        encoding="utf-8",
+    )
+    with make_client(tmp_path) as client:
+        response = client.get(
+            "/api/documents/..%5C..%5Csecret_ocr2%5Cvictim/page/0"
+        )
+        assert response.status_code == 404
+        assert "SECRET" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_compute_doc_stats(tmp_path):
     db_path = await seed_database(tmp_path)
     with sqlite3.connect(db_path) as connection:
