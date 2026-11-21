@@ -41,7 +41,7 @@ from .agent.models import AgentRun, AgentStep
 from .agent.runner import execute_run as agent_execute_run
 from .agent.runner import run_out as agent_run_out
 from .agent.runner import step_out as agent_step_out
-from .bindguard import enforce_bind_host
+from .bindguard import enforce_bind_host, is_allowed_origin, is_allowed_request_host
 from .db import make_engine, session_factory
 from .curation import issues as issues_mod
 from .index.documents import ranked_document_ids
@@ -748,8 +748,59 @@ def _remove_document_files(data_dir: Path, doc_id: str, file_path: str | None) -
     return removed
 
 
+class _HostOriginGuardMiddleware:
+    """Reject requests whose Host is not loopback, and cross-origin writes.
+
+    Pure ASGI so it adds no dependency and sees every request before routing.
+    Host is checked on every method (the DNS-rebinding defense); Origin is
+    checked only on state-changing methods, where a hostile page could
+    otherwise drive the unauthenticated local API (CSRF). Rejections are a
+    plain 400 with no CORS headers, so a cross-origin caller cannot read them.
+    """
+
+    _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1")
+                       for k, v in scope.get("headers", [])}
+            host = headers.get("host")
+            if not is_allowed_request_host(host):
+                await self._reject(send, "host")
+                return
+            if scope.get("method", "").upper() in self._WRITE_METHODS:
+                if not is_allowed_origin(headers.get("origin")):
+                    await self._reject(send, "origin")
+                    return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _reject(send, reason: str) -> None:
+        body = (
+            '{"detail":"request rejected by host/origin guard"}'
+            if reason
+            else "{}"
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="Toc Memex API", docs_url=None, redoc_url=None)
+    app.add_middleware(_HostOriginGuardMiddleware)
     app.state.db_path = db_path
     app.state.data_dir = data_dir or db_path.parent
     app.state.web_dir = web_dir

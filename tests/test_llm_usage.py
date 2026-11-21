@@ -339,7 +339,9 @@ async def test_call_detail_export_endpoint(tmp_path, monkeypatch):
         llm_log.log_path(tmp_path).read_text(encoding="utf-8").splitlines()[0]
     )["id"]
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+    # Loopback base_url so the request passes the Host/Origin guard (S2); the
+    # host is incidental to what this test checks (CSV export of a call).
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
         response = await client.get(f"/api/llm/calls/{call_id}/export")
         assert response.status_code == 200
         body = response.json()
