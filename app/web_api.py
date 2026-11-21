@@ -1197,7 +1197,13 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         target = upload_dir / name
         size = 0
         try:
-            with target.open("wb") as handle:
+            # Write chunks off the event loop. Uploading to a slow disk while we
+            # hold the loop would stall every other request (the status poll,
+            # the library page) for the length of the write. Each 1 MiB write
+            # is dispatched to a worker thread; memory stays bounded because we
+            # still stream instead of buffering the whole file.
+            handle = await asyncio.to_thread(target.open, "wb")
+            try:
                 while True:
                     piece = await file.read(1024 * 1024)
                     if not piece:
@@ -1207,7 +1213,9 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                         raise HTTPException(
                             status_code=413, detail="文件超过 200 MB 上限"
                         )
-                    handle.write(piece)
+                    await asyncio.to_thread(handle.write, piece)
+            finally:
+                await asyncio.to_thread(handle.close)
         except HTTPException:
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise
