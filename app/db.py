@@ -208,6 +208,14 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
             text("UPDATE lessons SET updated_at = created_at WHERE updated_at IS NULL")
         )
 
+    # curation_outcomes: closed-loop verification state (self-evolution L2).
+    # verify_json holds the before/after verifier metrics of one write;
+    # survival tracks the observation window (pending → survived/regressed).
+    await _add_column_if_missing(conn, "curation_outcomes", "verify_json", "TEXT")
+    await _add_column_if_missing(
+        conn, "curation_outcomes", "survival", "VARCHAR(10) NOT NULL DEFAULT 'pending'"
+    )
+
 
 async def _add_column_if_missing(conn, table: str, column: str, ddl: str) -> bool:  # noqa: ANN001
     """Add a column only if the table exists and lacks it.

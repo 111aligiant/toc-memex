@@ -477,6 +477,11 @@ class CurationOutcome(Base):
     # better | worse | neutral
     verdict: Mapped[str] = mapped_column(String(10), nullable=False, default="neutral")
     delta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Before/after verifier metrics for this write (docs/self-evolution.md §5.1);
+    # null for rows written without verification (--no-verify, legacy rows).
+    verify_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending | survived | regressed — observation-window state (§5.1.2).
+    survival: Mapped[str] = mapped_column(String(10), nullable=False, default="pending")
     actor: Mapped[str] = mapped_column(String(80), nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)

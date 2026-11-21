@@ -39,9 +39,12 @@ def _print_run(result: dict, as_json: bool) -> None:
         applied = sum(job.get("applied", 0) for job in doc["jobs"])
         print(f"  {doc['title'][:40]:42} applied {applied}")
         for job in doc["jobs"]:
-            state = job.get("skipped") or job.get("error") or (
-                f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
-            )
+            if job.get("auto_rolled_back"):
+                state = "auto-rolled back (verification degraded)"
+            else:
+                state = job.get("skipped") or job.get("error") or (
+                    f"applied {job.get('applied', 0)} / dropped {job.get('dropped', 0)}"
+                )
             print(f"    {job.get('kind', '?'):16} {state}")
     print(f"total applied ops: {result['applied']}; skipped: {result['skipped']}")
     if result.get("timed_out"):
@@ -86,6 +89,7 @@ async def _run(args) -> int:
                         max_chunk_chars=settings.tocmemex_max_chunk_chars,
                         use_agent=use_agent,
                         wall_clock_minutes=args.wall_clock,
+                        verify=args.verify,
                     )
                 except runner_lock.CuratorBusy as exc:
                     print(f"skipped: {exc}")
@@ -163,6 +167,71 @@ async def _undo(args) -> int:
                 print(
                     "注意：该提案没有快照（早于快照功能），整份文档已回到"
                     "curator 介入前的基线。"
+                )
+        return 0
+    finally:
+        await engine.dispose()
+
+
+async def _verify(args) -> int:
+    """Measure one document now; show the verifier readings and recent outcomes."""
+    from .curation.ops import build_context
+    from .curation.verify import snapshot_metrics
+    from .models import CurationOutcome, Document
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    set_engine(engine)
+    try:
+        async with session_factory(engine)() as db:
+            doc = await db.get(Document, args.doc_id)
+            if doc is None:
+                print(f"document not found: {args.doc_id}")
+                return 1
+            ctx = await build_context(db, doc, settings.tocmemex_data_dir)
+            metrics = await snapshot_metrics(ctx)
+            outcomes = (
+                (
+                    await db.execute(
+                        select(CurationOutcome)
+                        .where(CurationOutcome.doc_id == doc.id)
+                        .order_by(CurationOutcome.id.desc())
+                        .limit(20)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        payload = {
+            "doc_id": doc.id,
+            "title": doc.title,
+            "metrics": metrics,
+            "outcomes": [
+                {
+                    "action": row.action,
+                    "verdict": row.verdict,
+                    "survival": row.survival,
+                    "kind": row.kind,
+                    "strategy": row.strategy,
+                    "created_at": row.created_at,
+                    "verify": json.loads(row.verify_json) if row.verify_json else None,
+                }
+                for row in outcomes
+            ],
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        print(f"{doc.title[:60]}")
+        for name, value in (metrics or {}).items():
+            print(f"  {name:8} {value}")
+        if outcomes:
+            print("recent outcomes:")
+            for row in outcomes:
+                print(
+                    f"  [{row.action:14}] {row.verdict:7} survival={row.survival:9} "
+                    f"{row.kind or '-'} / {row.strategy or '-'} {row.created_at}"
                 )
         return 0
     finally:
@@ -376,7 +445,23 @@ def main(argv: list[str] | None = None) -> int:
             f"settings (default {runner.DEFAULT_WALL_CLOCK_MINUTES})"
         ),
     )
+    run.add_argument(
+        "--verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "closed-loop verification after every write: measure before/after, "
+            "roll back and write a negative lesson when metrics degrade "
+            "(default on; --no-verify restores pre-verification behaviour)"
+        ),
+    )
     run.add_argument("--json", action="store_true")
+
+    verify_cmd = sub.add_parser(
+        "verify", help="measure one document now and show recent outcome survival"
+    )
+    verify_cmd.add_argument("doc_id")
+    verify_cmd.add_argument("--json", action="store_true")
 
     report = sub.add_parser("report", help="strategy outcomes")
     report.add_argument("--json", action="store_true")
@@ -412,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         "undo": _undo,
         "audit": _audit,
         "repair-snapshots": _repair_snapshots,
+        "verify": _verify,
     }
     return asyncio.run(handlers[args.command](args))
 

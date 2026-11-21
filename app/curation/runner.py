@@ -305,6 +305,7 @@ async def run_rule_strategies(
     run_id: str,
     *,
     max_chunk_chars: int = 1200,
+    verify: bool = True,
 ) -> dict:
     """The no-LLM path for one job: plan, validate, apply, record.
 
@@ -362,7 +363,7 @@ async def run_rule_strategies(
     # old ordering passed the job id to apply_ops, so a snapshot existed but
     # could never be found by proposal id.
     proposal_id = new_uuid()
-    outcome = await apply_ops(ctx, ops, proposal_id)
+    outcome = await apply_ops(ctx, ops, proposal_id, verify=verify)
     proposal = await _record_proposal(
         db,
         job,
@@ -374,14 +375,40 @@ async def run_rule_strategies(
         proposal_id=proposal_id,
     )
 
+    verification = outcome.get("verify")
+    if verification and verification.get("verdict") == "worse":
+        # Closed-loop verification (self-evolution L2): the write measured
+        # worse than the pre-write state and has already been rolled back
+        # by apply_ops. Record it, leave a negative lesson, do not retry.
+        from .verify import record_auto_rollback
+
+        await record_auto_rollback(
+            db,
+            doc_id=doc.id,
+            issue_id=job.issue_id,
+            kind=job.kind,
+            strategy=strategy,
+            verify=verification,
+            proposal_id=proposal.id,
+        )
+        job.status = "skipped"
+        job.last_error = "auto rollback: " + "; ".join(verification.get("reasons") or [])
+        job.updated_at = utcnow_iso()
+        await db.flush()
+        return {
+            "job_id": job.id,
+            "kind": job.kind,
+            "strategy": strategy,
+            "proposal_id": proposal.id,
+            "applied": 0,
+            "auto_rolled_back": True,
+            "verify": verification,
+        }
+
     if outcome["applied_ops"]:
         job.status = "applied"
         delta = _delta_for(job.kind, chunks, await ctx.chunks())
-        verdict = "neutral"
-        if any(value < 0 for value in delta.values()):
-            verdict = "better"
-        elif any(value > 0 for value in delta.values()):
-            verdict = "worse"
+        verdict = _verdict_for(verification, delta)
         await record_outcome(
             db,
             doc_id=doc.id,
@@ -392,6 +419,7 @@ async def run_rule_strategies(
             verdict=verdict,
             actor="curator",
             delta=delta or None,
+            verify=verification,
             note=f"proposal {proposal.id}",
         )
     elif outcome["pending_ops"]:
@@ -424,6 +452,21 @@ def _delta_for(kind: str, before, after) -> dict:
     if kind == "missing-pages":
         return {"nodes": len(after) - len(before)}
     return {}
+
+
+def _verdict_for(verification: dict | None, delta: dict) -> str:
+    """Verdict for the outcome row: verifier verdict when available.
+
+    Falls back to the legacy delta heuristic for unmeasured writes
+    (``--no-verify``), keeping history comparable.
+    """
+    if verification:
+        return verification.get("verdict") or "neutral"
+    if any(value < 0 for value in delta.values()):
+        return "better"
+    if any(value > 0 for value in delta.values()):
+        return "worse"
+    return "neutral"
 
 
 async def _prior_context(db: AsyncSession, doc: Document, kind: str) -> str:
@@ -496,6 +539,7 @@ async def run_agent(
     *,
     max_calls: int | None = None,
     runtime: tuple | None = None,
+    verify: bool = True,
 ) -> dict:
     """The agent loop (P2). Falls back to rules when no LLM is configured.
 
@@ -503,7 +547,8 @@ async def run_agent(
     bound endpoint first, then the DB default, then ``.env`` — the same
     chain ingest uses. ``runtime`` lets ``run_once`` resolve once per run
     instead of once per document. ``max_calls`` also comes from the 编修
-    settings unless a caller forces it.
+    settings unless a caller forces it. ``verify`` rides through to the
+    dispatcher so every applied op is measured (self-evolution L2).
     """
     from ..llm.purpose import resolve_runtime
 
@@ -511,11 +556,15 @@ async def run_agent(
         runtime = await resolve_runtime(db, "bianxiu")
     settings, endpoint, cfg = runtime
     if settings is None:
-        return await run_rule_strategies(db, doc, data_dir, job, run_id)
+        return await run_rule_strategies(
+            db, doc, data_dir, job, run_id, verify=verify
+        )
 
     from ..llm.agent import run_tool_loop
 
-    dispatcher = Dispatcher(db, data_dir, doc.id, job_id=job.id, run_id=run_id)
+    dispatcher = Dispatcher(
+        db, data_dir, doc.id, job_id=job.id, run_id=run_id, verify=verify
+    )
     result = await run_tool_loop(
         dispatcher,
         doc,
@@ -534,7 +583,9 @@ async def run_agent(
         # The endpoint is configured but the call failed. With nothing yet
         # written, the deterministic path is still safe and better than a
         # maintenance pass that silently does nothing.
-        fallback = await run_rule_strategies(db, doc, data_dir, job, run_id)
+        fallback = await run_rule_strategies(
+            db, doc, data_dir, job, run_id, verify=verify
+        )
         fallback["agent_error"] = result["error"]
         return fallback
     if result.get("applied", 0) or result.get("pending", 0):
@@ -584,6 +635,7 @@ async def run_once(
     max_chunk_chars: int = 1200,
     use_agent: bool | None = None,
     wall_clock_minutes: float | None = None,
+    verify: bool = True,
 ) -> dict:
     """One curator run over the top-scored documents.
 
@@ -634,6 +686,11 @@ async def run_once(
     }
 
     async with run_lock(db, data_dir, run_id):
+        # Close observation windows first: yesterday's writes either held up
+        # or are already regressed; either way they stop being "pending".
+        from .outcomes import settle_outcomes
+
+        summary["settled"] = await settle_outcomes(db)
         documents = await select_documents(db, data_dir, limit=limit)
         job_kinds = (
             (*RULE_KINDS, *enabled_agent_kinds) if agent_enabled else RULE_KINDS
@@ -664,11 +721,17 @@ async def run_once(
                 try:
                     if agent_enabled:
                         result = await run_agent(
-                            db, doc, data_dir, job, run_id, runtime=runtime
+                            db, doc, data_dir, job, run_id, runtime=runtime, verify=verify
                         )
                     else:
                         result = await run_rule_strategies(
-                            db, doc, data_dir, job, run_id, max_chunk_chars=max_chunk_chars
+                            db,
+                            doc,
+                            data_dir,
+                            job,
+                            run_id,
+                            max_chunk_chars=max_chunk_chars,
+                            verify=verify,
                         )
                 except Exception as exc:  # one job's failure must not stop the run
                     job.status = "failed"

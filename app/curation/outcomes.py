@@ -8,6 +8,7 @@ falls back to a cost prior.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,16 @@ ACTIONS = (
     "llm_unavailable",
 )
 VERDICTS = ("better", "worse", "neutral")
+# Observation window (self-evolution L2): a write starts pending and is
+# settled to survived after this many days unless it was rolled back.
+SURVIVALS = ("pending", "survived", "regressed")
+OBSERVATION_DAYS = 7.0
+_ROLLBACK_ACTIONS = (
+    "auto_rollback",
+    "rolled_back",
+    "restored_by_human",
+    "restored_forced",
+)
 
 
 async def record_outcome(
@@ -38,12 +49,16 @@ async def record_outcome(
     strategy: str = "",
     verdict: str = "neutral",
     delta: dict | None = None,
+    verify: dict | None = None,
+    survival: str = "pending",
     note: str | None = None,
 ) -> CurationOutcome:
     if action not in ACTIONS:
         raise ValueError(f"invalid outcome action: {action}")
     if verdict not in VERDICTS:
         raise ValueError(f"invalid verdict: {verdict}")
+    if survival not in SURVIVALS:
+        raise ValueError(f"invalid survival: {survival}")
     row = CurationOutcome(
         doc_id=doc_id,
         issue_id=issue_id,
@@ -52,12 +67,103 @@ async def record_outcome(
         action=action,
         verdict=verdict,
         delta_json=json.dumps(delta, ensure_ascii=False) if delta else None,
+        verify_json=json.dumps(verify, ensure_ascii=False) if verify else None,
+        survival=survival,
         actor=actor,
         note=note,
     )
     db.add(row)
     await db.flush()
     return row
+
+
+async def mark_regressed(
+    db: AsyncSession, doc_id: str, issue_id: str | None = ""
+) -> CurationOutcome | None:
+    """Mark the newest still-pending applied outcome for this issue regressed.
+
+    Called when a write is undone — automatically by verification or by a
+    human — so the observation window can never count it as a success.
+    ``issue_id=None`` regresses every pending write on the document (used by
+    whole-document baseline restores, which invalidate all of them).
+    """
+    conditions = [
+        CurationOutcome.doc_id == doc_id,
+        CurationOutcome.action.in_(("applied", "partial")),
+        CurationOutcome.survival == "pending",
+    ]
+    if issue_id is not None:
+        conditions.append(CurationOutcome.issue_id == issue_id)
+    rows = (
+        (
+            await db.execute(
+                select(CurationOutcome)
+                .where(*conditions)
+                .order_by(CurationOutcome.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return None
+    for row in rows:
+        row.survival = "regressed"
+    await db.flush()
+    return rows[0]
+
+
+async def settle_outcomes(
+    db: AsyncSession, days: float = OBSERVATION_DAYS
+) -> int:
+    """Close the observation window for writes older than ``days``.
+
+    Pending outcomes whose document/issue later rolled back are already
+    ``regressed`` (marked at rollback time); everything else that survived
+    the window is marked ``survived``. Parsing uses the stored ISO strings.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    reversed_keys = {
+        (row.doc_id, row.issue_id)
+        for row in (
+            await db.execute(
+                select(CurationOutcome).where(
+                    CurationOutcome.action.in_(_ROLLBACK_ACTIONS)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    pending = (
+        (
+            await db.execute(
+                select(CurationOutcome).where(
+                    CurationOutcome.action.in_(("applied", "partial")),
+                    CurationOutcome.survival == "pending",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    settled = 0
+    for row in pending:
+        try:
+            created = datetime.fromisoformat(row.created_at)
+        except (TypeError, ValueError):
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created >= cutoff:
+            continue
+        row.survival = (
+            "regressed" if (row.doc_id, row.issue_id) in reversed_keys else "survived"
+        )
+        settled += 1
+    if settled:
+        await db.flush()
+    return settled
 
 
 async def strategy_report(db: AsyncSession) -> list[dict]:

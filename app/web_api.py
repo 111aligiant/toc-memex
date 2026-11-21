@@ -1783,7 +1783,9 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 await session.rollback()
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             if job.status == "proposed":
-                job.status = "applied"
+                # applied==0 means verification rolled the write back (or every
+                # op failed re-validation): the job did not take effect.
+                job.status = "applied" if result.get("applied") else "rejected"
             await session.commit()
         _invalidate_cache()
         return result
@@ -2074,7 +2076,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
 
     async def _record_restore_outcome(session, doc_id: str, result: dict, actor: str) -> None:
         """Ledger row for a restore; a human rollback is an outcome too."""
-        from .curation.outcomes import record_outcome
+        from .curation.outcomes import mark_regressed, record_outcome
 
         await record_outcome(
             session,
@@ -2084,6 +2086,8 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
             strategy="baseline_restore",
             note=f"baseline {result.get('baseline_id')}",
         )
+        # A whole-document restore invalidates every pending curatorial write.
+        await mark_regressed(session, doc_id, None)
 
     def _note_out(row) -> dict:
         return {

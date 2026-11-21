@@ -31,7 +31,7 @@ from ..models import (
 )
 from .baselines import latest_baseline, restore_baseline
 from .ops import build_context, restore_rows
-from .outcomes import record_outcome
+from .outcomes import mark_regressed, record_outcome
 from .snapshots import snapshot_for_proposal, snapshot_payload, write_snapshot
 
 
@@ -90,6 +90,9 @@ async def undo_proposal(
         actor="human:undo",
         note=f"{mode}; proposal {proposal_id}",
     )
+    # Observation window (self-evolution L2): a human undo means the write
+    # did not survive — never let it settle as "survived" later.
+    await mark_regressed(db, doc.id, job.issue_id)
     await db.flush()
     return {
         "proposal_id": proposal_id,

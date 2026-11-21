@@ -377,7 +377,7 @@ async def validate_op(ctx: ProposalContext, op: dict) -> tuple[str, str]:
 
 
 async def apply_ops(
-    ctx: ProposalContext, ops: list[dict], proposal_id: str
+    ctx: ProposalContext, ops: list[dict], proposal_id: str, *, verify: bool = True
 ) -> dict:
     """Validate and apply a whole proposal, op by op.
 
@@ -386,7 +386,15 @@ async def apply_ops(
     rest still run (mneme's "degrade, don't abort"). If applying would raise
     validate_toc's error count, everything applied so far is rolled back via
     the pre-write snapshot.
+
+    With ``verify`` (default on) the document is also measured before and
+    after the write; a degraded verdict (``verify.compare_metrics``) rolls
+    the write back the same way. The comparison rides on the result as
+    ``verify`` so the caller can record it and write a negative lesson.
     """
+    from .verify import compare_metrics, snapshot_metrics
+
+    metrics_before = await snapshot_metrics(ctx) if verify else None
     results: list[dict] = []
     applied: list[dict] = []
     errors_before = _error_count(await ctx.nodes())
@@ -468,6 +476,18 @@ async def apply_ops(
     if applied:
         await _rebuild_fts(ctx)
 
+    comparison = None
+    if applied and verify:
+        comparison = compare_metrics(metrics_before, await snapshot_metrics(ctx))
+        if comparison["verdict"] == "worse":
+            await _rollback_last_snapshot(ctx)
+            reasons = "; ".join(comparison.get("reasons") or [])
+            for entry in results:
+                if entry["status"] == "ok":
+                    entry["status"] = "dropped"
+                    entry["reason"] = f"rolled back: verification degraded ({reasons})"
+            applied = []
+
     return {
         "results": results,
         "applied_ops": len(applied),
@@ -475,6 +495,7 @@ async def apply_ops(
         "dropped_ops": sum(1 for entry in results if entry["status"] == "dropped"),
         "errors_before": errors_before,
         "errors_after": _error_count(await ctx.nodes()),
+        "verify": comparison,
     }
 
 

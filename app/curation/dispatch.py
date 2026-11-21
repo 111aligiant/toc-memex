@@ -74,6 +74,7 @@ class Dispatcher:
         job_id: str | None = None,
         run_id: str | None = None,
         budget: Budget | None = None,
+        verify: bool = True,
     ):
         self.db = db
         self.data_dir = data_dir
@@ -81,6 +82,8 @@ class Dispatcher:
         self.job_id = job_id
         self.run_id = run_id
         self.budget = budget or Budget()
+        # Closed-loop verification rides on every write (self-evolution L2).
+        self.verify = verify
 
     async def dispatch(self, name: str, args: dict | None = None) -> dict:
         args = dict(args or {})
@@ -113,7 +116,8 @@ class Dispatcher:
         proposal_id = new_uuid()
         job_id = await self._ensure_job()
         ctx = await build_context(self.db, doc, self.data_dir)
-        outcome = await apply_ops(ctx, ops, proposal_id)
+        outcome = await apply_ops(ctx, ops, proposal_id, verify=self.verify)
+        await self._handle_degraded(outcome, proposal_id, ops)
 
         verdict = "rejected"
         if outcome["applied_ops"] and not outcome["pending_ops"] and not outcome["dropped_ops"]:
@@ -143,8 +147,35 @@ class Dispatcher:
             "applied_ops": outcome["applied_ops"],
             "pending_ops": outcome["pending_ops"],
             "dropped_ops": outcome["dropped_ops"],
+            "verify": outcome.get("verify"),
             "budget": self.budget.state(),
         }
+
+    async def _handle_degraded(
+        self, outcome: dict, proposal_id: str, ops: list[dict]
+    ) -> None:
+        """Ledger + lesson when verification rolled a write back.
+
+        ``apply_ops`` already restored the pre-write snapshot; this leaves
+        the machine record (auto_rollback outcome) and the negative lesson
+        so the strategy ranking and the next run both learn from it.
+        """
+        verification = outcome.get("verify")
+        if not verification or verification.get("verdict") != "worse":
+            return
+        from .verify import record_auto_rollback
+
+        job = await self.db.get(CurationJob, self.job_id) if self.job_id else None
+        await record_auto_rollback(
+            self.db,
+            doc_id=self.doc_id,
+            issue_id=job.issue_id if job else "",
+            kind=job.kind if job else "agent",
+            strategy="agent_chunk" if _touches_chunks(ops) else "agent_toc",
+            verify=verification,
+            proposal_id=proposal_id,
+            actor="curator",
+        )
 
     async def _ensure_job(self) -> str:
         """A proposal needs a job row; a standalone call gets an agent job."""
@@ -209,7 +240,8 @@ class Dispatcher:
         ops = [payload.get("ops", [])[index] for index in pending_indexes]
         doc = await self.db.get(Document, self.doc_id)
         ctx = await build_context(self.db, doc, self.data_dir)
-        outcome = await apply_ops(ctx, ops, proposal_id)
+        outcome = await apply_ops(ctx, ops, proposal_id, verify=self.verify)
+        await self._handle_degraded(outcome, proposal_id, ops)
         row.verdict = "accepted" if outcome["applied_ops"] else "rejected"
         row.applied_ops = (row.applied_ops or 0) + outcome["applied_ops"]
         merged = [entry for entry in results if entry.get("status") != "pending"]
@@ -220,6 +252,7 @@ class Dispatcher:
             "proposal_id": proposal_id,
             "applied": outcome["applied_ops"],
             "results": outcome["results"],
+            "verify": outcome.get("verify"),
             "budget": self.budget.state(),
         }
 
