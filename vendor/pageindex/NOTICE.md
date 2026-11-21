@@ -22,6 +22,17 @@ Modifications:
 
 If you update PageIndex upstream, re-copy these files and update the commit hash above.
 
+## Deliberately incomplete vendoring
+
+Only the modules reachable from Toc Memex's call sites are vendored. The
+upstream tree also ships `integrations/`, `retry.py` and `tree_optimize.py`;
+they are absent here, so the helper functions in `utils.py` that import them
+lazily (`claude_code_complete`, `delay`, `normalize`, …) would raise
+`ModuleNotFoundError` if called. Toc Memex never calls those helpers — TOC
+parsing and summarisation go through `app/ingest/llm_toc.py` and
+`app/llm/client.py`. If a future change needs one of them, vendor the missing
+module (and its dependencies) instead of importing it from an unvendored path.
+
 ## Ported code (not vendored verbatim)
 
 `app/ingest/llm_toc.py` and `app/llm/client.py` port the prompt text and
