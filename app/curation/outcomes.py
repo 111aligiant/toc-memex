@@ -114,13 +114,19 @@ async def mark_regressed(
 
 
 async def settle_outcomes(
-    db: AsyncSession, days: float = OBSERVATION_DAYS
+    db: AsyncSession, days: float = OBSERVATION_DAYS, *, data_dir=None
 ) -> int:
     """Close the observation window for writes older than ``days``.
 
     Pending outcomes whose document/issue later rolled back are already
     ``regressed`` (marked at rollback time); everything else that survived
-    the window is marked ``survived``. Parsing uses the stored ISO strings.
+    the window is marked ``survived``.
+
+    With ``data_dir`` the settlement also re-measures the document and
+    compares the current verifier readings against the metrics stored at
+    write time (``verify_json["after"]``). A document that has drifted
+    worse since the write did not survive it — this catches writes made
+    with ``--no-verify`` and changes made outside the curator.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     reversed_keys = {
@@ -147,6 +153,28 @@ async def settle_outcomes(
         .scalars()
         .all()
     )
+    measured: dict[str, dict | None] = {}
+
+    async def _current_metrics(doc_id: str) -> dict | None:
+        """One measurement per document per call; None means "cannot check"."""
+        if doc_id in measured:
+            return measured[doc_id]
+        value: dict | None = None
+        if data_dir is not None:
+            try:
+                from ..models import Document
+                from .ops import build_context
+                from .verify import snapshot_metrics
+
+                doc = await db.get(Document, doc_id)
+                if doc is not None:
+                    ctx = await build_context(db, doc, data_dir)
+                    value = await snapshot_metrics(ctx)
+            except Exception:
+                value = None
+        measured[doc_id] = value
+        return value
+
     settled = 0
     for row in pending:
         try:
@@ -157,10 +185,33 @@ async def settle_outcomes(
             created = created.replace(tzinfo=timezone.utc)
         if created >= cutoff:
             continue
-        row.survival = (
-            "regressed" if (row.doc_id, row.issue_id) in reversed_keys else "survived"
-        )
         settled += 1
+        if (row.doc_id, row.issue_id) in reversed_keys:
+            row.survival = "regressed"
+            continue
+        after = None
+        if row.verify_json:
+            try:
+                after = json.loads(row.verify_json).get("after")
+            except ValueError:
+                after = None
+        if not after:
+            row.survival = "survived"
+            continue
+        current = await _current_metrics(row.doc_id)
+        if not current:
+            row.survival = "survived"
+            continue
+        from .verify import compare_metrics
+
+        comparison = compare_metrics(after, current)
+        if comparison["verdict"] == "worse":
+            row.survival = "regressed"
+            reasons = "; ".join(comparison.get("reasons") or [])
+            note = (row.note + "; " if row.note else "") + f"drift at settle: {reasons}"
+            row.note = note[:500]
+        else:
+            row.survival = "survived"
     if settled:
         await db.flush()
     return settled

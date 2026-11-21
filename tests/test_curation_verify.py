@@ -369,3 +369,80 @@ async def test_dispatcher_degrades_to_auto_rollback(tmp_path, monkeypatch):
     assert any(row.action == "auto_rollback" for row in outcomes)
     assert proposals and proposals[0].verdict == "rejected"
     await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_settle_detects_post_write_drift(tmp_path):
+    """A write can start well and drift worse inside the observation window."""
+    from app.curation.outcomes import record_outcome, settle_outcomes
+    from app.index.fts import index_document
+
+    engine = await _seed(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+    async with session_factory(engine)() as db:
+        db.add(
+            Document(
+                id="d2",
+                namespace_id="shared",
+                title="第二份试验方法",
+                filename="b.pdf",
+                file_path="b.pdf",
+                content_hash="h2",
+                page_count=5,
+                status="ready",
+            )
+        )
+        await db.flush()
+        db.add(
+            TocNode(
+                doc_id="d2", node_id="d2:h:1", level=1, heading_num="1",
+                title="1 范围", heading_path="1 范围", page_start=1, page_end=1,
+            )
+        )
+        await db.flush()
+        d2_chunk = Chunk(
+            doc_id="d2", node_id="d2:h:1", chunk_index=0,
+            content="本文件规定了恒定湿热试验方法。", heading_path="1 范围",
+            page_start=1, page_end=1,
+        )
+        db.add(d2_chunk)
+        await db.flush()
+        d2 = await db.get(Document, "d2")
+        await index_document(db, d2, [d2_chunk])
+
+        d1 = await db.get(Document, "d1")
+        m1 = await verify_mod.snapshot_metrics(
+            ProposalContext(db=db, doc=d1, pages={}, data_dir=None)
+        )
+        m2 = await verify_mod.snapshot_metrics(
+            ProposalContext(db=db, doc=d2, pages={}, data_dir=None)
+        )
+
+        def _verify(m):
+            return {"verdict": "neutral", "reasons": [], "deltas": {}, "before": m, "after": m}
+
+        stable = await record_outcome(
+            db, doc_id="d1", issue_id="a", action="applied", actor="curator",
+            kind="short-chunks", strategy="rule_merge", verify=_verify(m1),
+        )
+        drifting = await record_outcome(
+            db, doc_id="d2", issue_id="b", action="applied", actor="curator",
+            kind="short-chunks", strategy="rule_merge", verify=_verify(m2),
+        )
+        stable.created_at = old
+        drifting.created_at = old
+        # After the write: a new short chunk appears and FTS is not updated.
+        db.add(
+            Chunk(
+                doc_id="d2", node_id="d2:h:1", chunk_index=1, content="短",
+                heading_path="1 范围", page_start=1, page_end=1,
+            )
+        )
+        await db.commit()
+
+        settled = await settle_outcomes(db, data_dir=tmp_path)
+        await db.commit()
+    assert settled == 2
+    assert stable.survival == "survived"
+    assert drifting.survival == "regressed"
+    assert "drift at settle" in (drifting.note or "")
+    await engine.dispose()

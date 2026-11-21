@@ -690,7 +690,7 @@ async def run_once(
         # or are already regressed; either way they stop being "pending".
         from .outcomes import settle_outcomes
 
-        summary["settled"] = await settle_outcomes(db)
+        summary["settled"] = await settle_outcomes(db, data_dir=data_dir)
         documents = await select_documents(db, data_dir, limit=limit)
         job_kinds = (
             (*RULE_KINDS, *enabled_agent_kinds) if agent_enabled else RULE_KINDS
