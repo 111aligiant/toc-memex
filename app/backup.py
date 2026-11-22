@@ -54,16 +54,17 @@ def backup_data_dir(data_dir: Path, *, keep: int = 3) -> Path | None:
     backups_dir = data_dir / "backups"
     backups_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    archive = backups_dir / f"tocmemex-{stamp}.zip"
     # ``datetime.now()`` on Windows has ~10ms resolution, so two backups in the
-    # same tick get the same microsecond stamp and the second silently reuses
-    # (overwrites) the first archive. Add a counter suffix until the name is
-    # free, so every call returns a distinct file even under a coarse clock.
-    if archive.exists():
-        n = 1
-        while (candidate := backups_dir / f"tocmemex-{stamp}-{n}.zip").exists():
-            n += 1
-        archive = candidate
+    # same tick get the same microsecond stamp. Every archive carries a
+    # zero-padded counter, even the first one: ``-000`` sorts before ``-001``,
+    # so ``_rotate``'s plain name sort stays chronological. (Appending a
+    # suffix only on collision would sort the newcomer *before* its base name,
+    # because '-' < '.', and rotation could delete the backup just written.)
+    n = 0
+    archive = backups_dir / f"tocmemex-{stamp}-{n:03d}.zip"
+    while archive.exists():
+        n += 1
+        archive = backups_dir / f"tocmemex-{stamp}-{n:03d}.zip"
 
     with tempfile.TemporaryDirectory(prefix="tocmemex-backup-") as temp:
         snapshot = Path(temp) / "tocmemex.db"

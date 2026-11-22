@@ -20,7 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
-from .bindguard import enforce_bind_host
+from .bindguard import enforce_bind_host, is_allowed_request_host
 from .ingest.printed_toc import toc_page_indices
 from .ingest.toc import validate_toc
 from .ocr.cache import OcrCacheError, load_cached_pages
@@ -287,6 +287,14 @@ class InspectorHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
+        # Loopback binding does not stop DNS rebinding: a page on
+        # evil.example can re-resolve its own name to 127.0.0.1 and read this
+        # API while the browser still sends ``Host: evil.example``. The
+        # inspector is read-only but serves document text, so it needs the
+        # same Host check as the web app (S2).
+        if not is_allowed_request_host(self.headers.get("Host")):
+            self._json({"error": "request rejected by host guard"}, 400)
+            return
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
 

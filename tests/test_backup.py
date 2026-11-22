@@ -1,7 +1,9 @@
 import sqlite3
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
+import app.backup as backup_mod
 from app.backup import backup_data_dir
 
 
@@ -42,6 +44,29 @@ def test_backup_rotates_and_is_readable(tmp_path):
         zf.extract("tocmemex.db", tmp_path / "extract")
     with sqlite3.connect(tmp_path / "extract" / "tocmemex.db") as restored:
         assert restored.execute("select x from t").fetchone()[0] == "hello"
+
+
+def test_backup_same_tick_keeps_the_newest(tmp_path, monkeypatch):
+    """Windows' coarse clock makes same-tick collisions real. Rotation must
+    keep the archive just written, which a collision-only suffix breaks:
+    'tocmemex-<stamp>-1.zip' sorts *before* 'tocmemex-<stamp>.zip'."""
+    data = tmp_path / "data"
+    data.mkdir()
+    _make_db(data)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001
+            return cls(2026, 1, 1, 12, 0, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(backup_mod, "datetime", FrozenDatetime)
+
+    first = backup_data_dir(data, keep=2)
+    second = backup_data_dir(data, keep=1)
+    assert first is not None and second is not None
+    assert first != second
+    assert second.exists()
+    assert not first.exists()
 
 
 def test_missing_db_is_a_noop(tmp_path):

@@ -5,6 +5,7 @@ import shutil
 import sqlite3
 import threading
 import urllib.request
+from http.client import HTTPConnection
 from pathlib import Path
 
 import pytest
@@ -185,6 +186,40 @@ async def test_inspector_http_endpoints(tmp_path):
             assert response.status == 200
             html = response.read().decode("utf-8")
             assert "Toc Memex Inspector" in html
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_inspector_rejects_rebinding_host(tmp_path):
+    """S2 for the inspector: DNS rebinding arrives with the attacker's Host.
+
+    Binding to loopback alone does not stop it; the inspector serves document
+    text, so a request whose Host is not loopback must be refused.
+    """
+    db_path = await seed_database(tmp_path)
+    server = make_server(db_path, "127.0.0.1", 0, tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        try:
+            connection.request(
+                "GET", "/api/documents", headers={"Host": "evil.example"}
+            )
+            response = connection.getresponse()
+            assert response.status == 400
+        finally:
+            connection.close()
+        # The real UI (loopback Host) keeps working.
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{server.server_address[1]}/api/documents"
+        ) as response:
+            assert response.status == 200
     finally:
         server.shutdown()
         server.server_close()

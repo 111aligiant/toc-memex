@@ -97,11 +97,10 @@ def _log_session_id(ctx: Context | None) -> str | None:
 def _session_id(ctx: Context | None) -> str | None:
     """Server-assigned id for the caller's MCP connection.
 
-    Cached on the connection object, which is stable for the life of one
-    client connection and distinct between connections (verified: two
-    sequential stdio clients get different ids, two calls in one
-    connection share one). This is the only identity signal a client
-    cannot forge — but it identifies a *connection*, not a model.
+    Stored in ``Connection.state``, the SDK's documented per-connection
+    scratch dict (it persists across requests on the same connection and is
+    fresh for a new one). This is the only identity signal a client cannot
+    forge — but it identifies a *connection*, not a model.
     """
     if ctx is None:
         return None
@@ -109,12 +108,16 @@ def _session_id(ctx: Context | None) -> str | None:
         connection = ctx.session._connection
     except Exception:
         return None
-    existing = getattr(connection, "_memex_session_id", None)
+    state = getattr(connection, "state", None)
+    if not isinstance(state, dict):
+        # Test doubles / SDK versions without Connection.state.
+        state = connection.__dict__
+    existing = state.get("memex_session_id")
     if existing:
         return existing
     assigned = uuid.uuid4().hex
     try:
-        connection._memex_session_id = assigned
+        state["memex_session_id"] = assigned
     except Exception:
         return None
     return assigned
@@ -1164,7 +1167,11 @@ async def activity_write(
       Verify the original content yourself before accepting. You cannot
       confirm your own erratum — the reviewer must differ from the
       proposer.
-    Reads are auto-logged by read_section; do not write them manually."""
+    Reads are auto-logged by read_section; do not write them manually.
+
+    session_id is accepted for backwards compatibility and ignored: the
+    server always stamps the connection's own session, which a client
+    cannot choose."""
     async with _session() as db:
         activity = await _activity.activity_write(
             db,

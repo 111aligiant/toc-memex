@@ -36,8 +36,8 @@ async def _seed(tmp_path, monkeypatch):
 
 
 def _ctx(session_token: str):
-    """A fake MCP Context whose connection caches a fixed server session id."""
-    connection = SimpleNamespace(_memex_session_id=session_token)
+    """A fake MCP Context whose connection carries a fixed server session id."""
+    connection = SimpleNamespace(state={"memex_session_id": session_token})
     return SimpleNamespace(session=SimpleNamespace(_connection=connection))
 
 

@@ -62,6 +62,11 @@ const RUN_MAX_CALLS = 9_999
 const RUN_TOKEN_BUDGET = 2_000_000
 
 let timer = null
+// Bumped by every stopPolling() and refresh(). A refresh compares its own
+// generation after the network wait: if another refresh or a stop happened
+// meanwhile, it drops the stale response instead of clobbering state or
+// scheduling a second, overlapping poll loop.
+let refreshSeq = 0
 let historyTimer = null
 let historyLoadedFor = null
 let lastStepCount = -1
@@ -308,6 +313,7 @@ const runTone = computed(() => {
 })
 
 function stopPolling() {
+  refreshSeq += 1
   if (timer) {
     clearTimeout(timer)
     timer = null
@@ -327,8 +333,11 @@ async function refresh(id) {
   // call while a timer is pending would start a second, independent
   // self-rescheduling loop and double the request rate.
   stopPolling()
+  const seq = refreshSeq
   try {
     const data = await fetchRun(id)
+    // A newer refresh or an explicit stop superseded this one while it waited.
+    if (seq !== refreshSeq) return
     run.value = data.run
     const count = data.run.steps?.length ?? 0
     if (count !== lastStepCount) {
@@ -358,6 +367,7 @@ async function refresh(id) {
       timer = setTimeout(() => refresh(id), quietMs > 30_000 ? 3000 : 700)
     }
   } catch (err) {
+    if (seq !== refreshSeq) return
     error.value = err.message
     stopPolling()
   }
