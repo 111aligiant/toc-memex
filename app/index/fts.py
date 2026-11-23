@@ -463,7 +463,11 @@ async def doc_ids_for_filters(
 
     for key, op in (("date_from", ">="), ("date_to", "<=")):
         if key in filters:
-            value = _filter_string(filters, key)
+            value = _filter_string(filters, key).strip()
+            # An empty/blank bound is not a bound: treat it as absent rather
+            # than as an always-true comparison.
+            if not value:
+                continue
             column = Document.doc_date
             condition = column >= value if op == ">=" else column <= value
             rows = await db.execute(
@@ -777,6 +781,38 @@ def _scope_label(scope: Scope) -> str:
     return UNASSIGNED
 
 
+async def scoped_miss_status(
+    db: AsyncSession, query: str, scope: Scope, top_k: int = 3
+) -> tuple[str | None, bool]:
+    """Return ``(hint, has_hits_elsewhere)`` for a zero-hit scoped search.
+
+    ``has_hits_elsewhere`` distinguishes "wrong collection" (``scoped_miss``)
+    from "the library has nothing" (``no_match``): the hint text alone is not
+    enough to tell the two apart reliably.
+    """
+    if not scope.active:
+        return None, False
+    label = _scope_label(scope)
+    elsewhere = await search_chunks(db, query, top_k=max(1, top_k))
+    counts: dict[str, int] = {}
+    for hit in elsewhere:
+        collection = hit.get("collection")
+        name = collection["name"] if collection else UNASSIGNED
+        counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return (
+            f"0 hits in collection '{label}'. No other collection has hits "
+            "either; try a shorter query or a section number.",
+            False,
+        )
+    listing = ", ".join(f"{name} ({count})" for name, count in counts.items())
+    return (
+        f"0 hits in collection '{label}'. Other collections with hits: "
+        f"{listing}. Re-run without collection, or pick another.",
+        True,
+    )
+
+
 async def scoped_miss_hint(
     db: AsyncSession, query: str, scope: Scope, top_k: int = 3
 ) -> str | None:
@@ -788,25 +824,8 @@ async def scoped_miss_hint(
     per collection, so the counts match what the agent sees after dropping
     the filter.
     """
-    if not scope.active:
-        return None
-    label = _scope_label(scope)
-    elsewhere = await search_chunks(db, query, top_k=max(1, top_k))
-    counts: dict[str, int] = {}
-    for hit in elsewhere:
-        collection = hit.get("collection")
-        name = collection["name"] if collection else UNASSIGNED
-        counts[name] = counts.get(name, 0) + 1
-    if not counts:
-        return (
-            f"0 hits in collection '{label}'. No other collection has hits "
-            "either; try a shorter query or a section number."
-        )
-    listing = ", ".join(f"{name} ({count})" for name, count in counts.items())
-    return (
-        f"0 hits in collection '{label}'. Other collections with hits: "
-        f"{listing}. Re-run without collection, or pick another."
-    )
+    hint, _ = await scoped_miss_status(db, query, scope, top_k)
+    return hint
 
 
 _SEARCH_MODES = ("auto", "lexical", "semantic", "hybrid")
@@ -1009,7 +1028,10 @@ async def scoped_search(
         if not seg_query(normalize_encoding_artifacts(query or "")):
             empty_reason = "no_terms"
         elif scope.active:
-            empty_reason = "scoped_miss"
+            # "Wrong collection" only when the same query does hit somewhere
+            # else; otherwise the library genuinely has nothing.
+            _hint, has_elsewhere = await scoped_miss_status(db, query, scope)
+            empty_reason = "scoped_miss" if has_elsewhere else "no_match"
         else:
             empty_reason = "no_match"
     hints = await _miss_hints(db, query, scope, filters, results)

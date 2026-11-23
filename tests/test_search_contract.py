@@ -294,6 +294,50 @@ async def test_empty_reason_no_match(tmp_path):
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_empty_reason_scoped_miss_only_when_elsewhere_has_hits(tmp_path):
+    engine, Session = await _seed(tmp_path)
+    async with Session() as db:
+        coll = await create_collection(db, "甲区")
+        doc = await db.get(Document, "a")
+        doc.collection_id = coll.id
+        await db.commit()
+        result = await scoped_search(db, "归档", top_k=5, collection=coll.id)
+    assert result["results"] == []
+    assert result["empty_reason"] == "scoped_miss"
+    assert "Other collections with hits" in result["hints"][0]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_empty_reason_scope_with_no_hits_anywhere_is_no_match(tmp_path):
+    engine, Session = await _seed(tmp_path)
+    async with Session() as db:
+        coll = await create_collection(db, "甲区")
+        doc = await db.get(Document, "a")
+        doc.collection_id = coll.id
+        await db.commit()
+        result = await scoped_search(
+            db, "完全不存在术语xyz", top_k=5, collection=coll.id
+        )
+    assert result["results"] == []
+    assert result["empty_reason"] == "no_match"
+    assert "No other collection has hits" in result["hints"][0]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_blank_date_bounds_are_ignored(tmp_path):
+    engine, Session = await _seed(tmp_path)
+    async with Session() as db:
+        result = await scoped_search(
+            db, "校准", top_k=5, filters={"date_from": "", "date_to": "  "}
+        )
+    assert result["results"]
+    assert result["empty_reason"] is None
+    await engine.dispose()
+
+
 # ── hints / next / channels ───────────────────────────────────────────
 
 
