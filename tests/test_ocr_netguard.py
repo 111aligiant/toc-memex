@@ -88,6 +88,9 @@ async def test_probe_reports_ssrf_refusal_instead_of_requesting():
             tocmemex_ocr_provider="mistral",
             mistral_api_key="k",
             mistral_api_url="http://127.0.0.1:8791/v1/ocr",
+            # Pin the default so a developer's .env opt-in does not turn this
+            # guard test into a no-op.
+            tocmemex_ocr_allow_private_hosts=False,
         )
     )
     result = await provider.probe()

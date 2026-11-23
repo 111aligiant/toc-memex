@@ -141,6 +141,53 @@ async def test_parse_pdf_falls_back_to_ocr_when_text_layer_unusable(
 
 
 @pytest.mark.asyncio
+async def test_parse_pdf_force_ocr_skips_text_layer(tmp_path, monkeypatch):
+    pdf = tmp_path / "text.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+
+    def _unreachable(path):  # noqa: ANN001
+        raise AssertionError("force_ocr must not read the text layer")
+
+    monkeypatch.setattr(pipeline, "parse_pdf_text", _unreachable)
+    monkeypatch.setattr(pipeline, "read_pdf_bookmarks", lambda path: [])
+    monkeypatch.setattr(pipeline, "build_ocr_provider", lambda settings: FakeOcr())
+
+    parsed = await pipeline._parse(
+        pdf, "d1", settings_for(tmp_path), None, force_ocr=True
+    )
+
+    assert parsed.pages[0].blocks[0].content == "1 范围"
+
+
+@pytest.mark.asyncio
+async def test_open_ingest_row_force_reparses_a_ready_document(tmp_path):
+    engine = make_engine(tmp_path / "tocmemex.db")
+    await init_db(engine)
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    content_hash = pipeline._sha256(pdf)
+    args = (engine, pdf, "shared", None, None, content_hash, "文本直读")
+
+    doc_id, should_parse = await pipeline._open_ingest_row(*args)
+    assert should_parse
+    async with session_factory(engine)() as db:
+        doc = await db.get(Document, doc_id)
+        doc.status = "ready"
+        await db.commit()
+
+    same_id, should_parse = await pipeline._open_ingest_row(*args)
+    assert (same_id, should_parse) == (doc_id, False)
+
+    forced_id, should_parse = await pipeline._open_ingest_row(*args, force=True)
+    assert (forced_id, should_parse) == (doc_id, True)
+    async with session_factory(engine)() as db:
+        doc = await db.get(Document, doc_id)
+        assert doc.status == "parsing"
+        assert doc.parse_plan == "文本直读"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_save_resources_sends_paddle_token_for_images(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 

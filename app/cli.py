@@ -59,6 +59,7 @@ async def _ingest(args) -> int:
     await init_db(engine)
     set_engine(engine)
     try:
+        force_ocr = getattr(args, "force_ocr", False)
         doc_id = await ingest_path(
             Path(args.path),
             namespace=args.namespace,
@@ -66,6 +67,8 @@ async def _ingest(args) -> int:
             doc_date=args.date,
             settings=settings,
             image_mode=getattr(args, "image_mode", "structured"),
+            force=getattr(args, "force", False) or force_ocr,
+            force_ocr=force_ocr,
         )
         print(doc_id)
         return 0
@@ -721,6 +724,16 @@ def main(argv: list[str] | None = None) -> int:
     # searchable text document. Non-image files ignore it.
     ingest.add_argument(
         "--image-mode", choices=["structured", "text"], default="structured"
+    )
+    ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="re-parse even if the same bytes are already in the library",
+    )
+    ingest.add_argument(
+        "--force-ocr",
+        action="store_true",
+        help="skip the direct text layer and always run OCR (implies --force)",
     )
 
     sub.add_parser("stats", help="show document/toc/chunk counts")

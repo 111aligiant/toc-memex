@@ -443,6 +443,7 @@ async def _parse(
     ocr_settings: Settings | None = None,
     provenance: dict | None = None,
     image_mode: str = "structured",
+    force_ocr: bool = False,
 ) -> ParsedDocument:
     """Parse one file into pages.
 
@@ -458,11 +459,15 @@ async def _parse(
     ``image_mode`` applies to standalone images only: ``structured`` (the
     default, current behaviour) or ``text`` (one plain-text document, see
     ``persist_plain_text``). It never changes how PDFs/DOCX are parsed.
+
+    ``force_ocr`` skips the direct text layer and goes straight to OCR for
+    PDF/DOCX. It is how a corpus that was ingested before OCR existed can be
+    rebuilt on OCR pages even when the file's text layer is readable.
     """
     ocr_settings = ocr_settings or settings
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        if ocr_client is None:
+        if ocr_client is None and not force_ocr:
             try:
                 parsed = parse_pdf_text(path)
             except Exception:
@@ -485,7 +490,7 @@ async def _parse(
         _record_parse(provenance, parsed, "ocr", ocr_settings)
         return parsed
     if suffix in {".docx", ".doc"}:
-        if ocr_client is None:
+        if ocr_client is None and not force_ocr:
             try:
                 parsed = parse_docx_direct(path)
                 if parsed.pages and _docx_direct_has_text(parsed):
@@ -1148,6 +1153,8 @@ async def _open_ingest_row(
     doc_date: str | None,
     content_hash: str,
     plan: str,
+    *,
+    force: bool = False,
 ) -> tuple[str, bool]:
     """Create the documents row before parsing starts.
 
@@ -1159,7 +1166,8 @@ async def _open_ingest_row(
     already in this namespace (ready or in flight) and the caller must stop.
     A previously *failed* row is reused and re-ingested in place, which is
     what makes re-uploading a file after a failure work instead of being
-    reported as a duplicate forever.
+    reported as a duplicate forever. ``force`` re-uses a ready row the same
+    way, for a deliberate corpus rebuild.
     """
     Session = session_factory(engine)
     async with Session() as db:
@@ -1172,7 +1180,7 @@ async def _open_ingest_row(
                 )
             )
         ).scalar_one_or_none()
-        if existing is not None and existing.status != "failed":
+        if existing is not None and existing.status != "failed" and not force:
             return existing.id, False
         if existing is not None:
             existing.status = "parsing"
@@ -1339,7 +1347,11 @@ async def ingest_path(
     ocr_client: BaseOcrProvider | None = None,
     settings: Settings | None = None,
     image_mode: str = "structured",
+    force: bool = False,
+    force_ocr: bool = False,
 ) -> str:
+    """Ingest one file. ``force`` re-parses an already-ingested file in
+    place; ``force_ocr`` additionally skips direct text extraction."""
     settings = settings or get_settings()
     path = Path(path)
     suffix = path.suffix.lower()
@@ -1355,6 +1367,7 @@ async def ingest_path(
         doc_date,
         content_hash,
         guess_parse_plan(path, image_mode),
+        force=force,
     )
     if not should_parse:
         return doc_id
@@ -1382,6 +1395,7 @@ async def ingest_path(
             ocr_settings,
             provenance=parse_provenance,
             image_mode=image_mode,
+            force_ocr=force_ocr,
         )
     except Exception as exc:
         logger.exception("ingest parse failed for %s", doc_id)
