@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import contextvars
 import functools
+import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -45,9 +46,13 @@ from .index import resources as _resources
 from .index.sections import read_section as _read_section
 from .models import AgentNote, Document
 
+logger = logging.getLogger(__name__)
+
 PROFILE_DEFAULT = "default"
 PROFILE_FULL = "full"
 _PROFILES = {PROFILE_DEFAULT, PROFILE_FULL}
+# Warn once per process about an unknown TOCMEMEX_TOOLS value.
+_INVALID_PROFILE_WARNED = False
 
 # The 8-tool surface advertised to external agents by default. Everything
 # else is still implemented and reachable through the ``full`` profile.
@@ -85,8 +90,14 @@ server = MCPServer(
 
 def _active_profile() -> str:
     """Profile selected by ``TOCMEMEX_TOOLS``; unknown values mean default."""
+    global _INVALID_PROFILE_WARNED
     value = (get_settings().tocmemex_tools or PROFILE_DEFAULT).strip().lower()
-    return value if value in _PROFILES else PROFILE_DEFAULT
+    if value not in _PROFILES:
+        if not _INVALID_PROFILE_WARNED:
+            _INVALID_PROFILE_WARNED = True
+            logger.warning("未知 TOCMEMEX_TOOLS 值 %r，已回落到 default", value)
+        return PROFILE_DEFAULT
+    return value
 
 
 def tool(*, name: str | None = None, profile: str = PROFILE_DEFAULT):
