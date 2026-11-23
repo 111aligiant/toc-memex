@@ -16,7 +16,7 @@ Usage::
         --golden benchmarks/papers/golden.jsonl \
         --top-k 5 \
         --out data/eval/report-papers.json \
-        [--json] [--fail-under hit_at_k=0.8]
+        [--json] [--no-ask] [--no-timestamp] [--fail-under hit_at_k=0.8]
 
 Exit codes: 0 ok, 1 below ``--fail-under``, 2 golden/DB read failure.
 
@@ -38,9 +38,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.db import ensure_schema, make_engine, session_factory  # noqa: E402
 from app.index.ask import ask_question  # noqa: E402
-from app.index.fts import search_chunks  # noqa: E402
-from app.index.sections import normalize_section_number, read_section  # noqa: E402
+from app.index.fts import build_match, search_chunks  # noqa: E402
+from app.index.sections import (  # noqa: E402
+    extract_section_numbers,
+    normalize_section_number,
+    read_section,
+)
 from app.models import TocNode  # noqa: E402
+from app.textnorm import normalize_encoding_artifacts  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 # Metrics that are better when lower; used by the markdown printer and in
@@ -123,6 +128,16 @@ def normalize_golden_item(raw: dict) -> dict:
     if not expected.get("pages") and raw.get("expected_pages") is not None:
         expected["pages"] = raw["expected_pages"]
 
+    # Page basis: golden pages are 1-based PDF pages by default (R18/R28).
+    # ``printed`` is only meaningful once page labels are stored; a printed
+    # item without labels is scored as n/a by the page metrics.
+    page_basis = str(expected.get("page_basis") or "pdf").strip().lower()
+    if page_basis not in {"pdf", "printed"}:
+        raise ValueError(
+            f"golden item {item_id!r} has unknown page_basis {page_basis!r}"
+            " (expected 'pdf' or 'printed')"
+        )
+
     heading_nums = [
         h for h in (normalize_section_number(v) for v in _as_str_list(
             expected.get("heading_nums")
@@ -144,6 +159,7 @@ def normalize_golden_item(raw: dict) -> dict:
             "heading_nums": heading_nums,
             "primary_heading_num": primary,
             "pages": _as_page_ranges(expected.get("pages")),
+            "page_basis": page_basis,
             "answer_contains": _as_str_list(expected.get("answer_contains")),
         },
         "forbidden": {
@@ -197,12 +213,31 @@ def page_matches(pages_a: list[list[int]], pages_b: list[list[int]]) -> bool:
     )
 
 
-def _hit_pages(hit: dict) -> list[list[int]]:
-    start = hit.get("page_start")
-    end = hit.get("page_end")
+def pages_for_basis(record: dict | None, basis: str = "pdf") -> list[list[int]] | None:
+    """Pages of a hit/section/citation in the golden's page basis.
+
+    ``pdf`` is 1-based: prefer the ``pdf_page_*`` fields rounds 02/03 add,
+    otherwise shift the internal 0-based ``page_start/page_end`` by +1.
+    ``printed`` can only be answered from stored ``printed_page_*`` labels;
+    without them the metric is not judgeable and ``None`` is returned (n/a).
+    """
+    record = record or {}
+    if basis == "printed":
+        start = record.get("printed_page_start")
+        end = record.get("printed_page_end")
+        if start is None or end is None:
+            return None
+        return [[int(start), int(end)]]
+
+    start = record.get("pdf_page_start")
+    end = record.get("pdf_page_end")
+    if start is not None and end is not None:
+        return [[int(start), int(end)]]
+    start = record.get("page_start")
+    end = record.get("page_end")
     if start is None or end is None:
         return []
-    return [[start, end]]
+    return [[int(start) + 1, int(end) + 1]]
 
 
 def _doc_matches(hit: dict, expected: dict) -> bool:
@@ -222,16 +257,63 @@ def is_correct(hit: dict, item: dict) -> bool:
     # Page overlap is a fallback only for hits without a heading; otherwise a
     # wrong section on the same page would mask a ranking miss.
     if normalize_section_number(hit.get("heading_num")) is None:
-        return page_matches(_hit_pages(hit), expected["pages"])
+        pages = pages_for_basis(hit, expected["page_basis"])
+        return False if pages is None else page_matches(pages, expected["pages"])
     return False
 
 
+def _page_at_1(top: dict | None, expected: dict) -> bool | None:
+    """Top-1 page match, or None when the basis cannot be judged (printed
+    pages without stored labels) so aggregation leaves it out."""
+    if not expected["pages"]:
+        return False
+    pages = pages_for_basis(top, expected["page_basis"])
+    if pages is None:
+        return None
+    if top is None or not _doc_matches(top, expected):
+        return False
+    return page_matches(pages, expected["pages"])
+
+
+def empty_reason(query: str, hits: list[dict]) -> str | None:
+    """Why a search came back empty, following round-02's priority order.
+
+    Round 02 adds ``empty_reason`` to the MCP search contract; the harness
+    calls ``search_chunks`` directly. Until 02 lands we reproduce the two
+    reasons an unscoped harness query can have: ``no_terms`` (nothing left
+    after stop-word/identifier stripping) then ``no_match``.
+    """
+    if hits:
+        return None
+    normalized = normalize_encoding_artifacts(query)
+    if not build_match(normalized) and not extract_section_numbers(normalized):
+        return "no_terms"
+    return "no_match"
+
+
 async def eval_retrieval(db, items: list[dict], top_k: int) -> list[dict]:
-    """Score section retrieval for every golden item. Returns one row each."""
+    """Score section retrieval for every golden item. Returns one row each.
+
+    ``kind="no_answer"`` rows are searchable but not scored: they never
+    enter the hit@k / primary@1 / page@1 / mrr denominators, and only carry
+    the deterministic ``empty_reason`` for the report's no_answer section.
+    """
     rows: list[dict] = []
     for item in items:
         expected = item["expected"]
         hits = await search_chunks(db, item["query"], top_k=top_k)
+        if item["kind"] == "no_answer":
+            rows.append(
+                {
+                    "id": item["id"],
+                    "query": item["query"],
+                    "kind": item["kind"],
+                    "scored": False,
+                    "empty_reason": empty_reason(item["query"], hits),
+                    "result_count": len(hits),
+                }
+            )
+            continue
         top = hits[0] if hits else None
         correct_rank = next(
             (rank for rank, hit in enumerate(hits, 1) if is_correct(hit, item)),
@@ -240,12 +322,16 @@ async def eval_retrieval(db, items: list[dict], top_k: int) -> list[dict]:
         primary = expected["primary_heading_num"]
         top_heading = normalize_section_number(top.get("heading_num")) if top else None
         top_doc = top.get("doc_id") if top else None
-        top_pages = _hit_pages(top) if top else []
+        top_pages = pages_for_basis(top, expected["page_basis"]) if top else []
         rows.append(
             {
                 "id": item["id"],
                 "query": item["query"],
                 "kind": item["kind"],
+                "scored": True,
+                "empty_reason": empty_reason(item["query"], hits),
+                "result_count": len(hits),
+                "page_basis": expected["page_basis"],
                 "top_doc": top_doc[:8] if top_doc else None,
                 "top_heading": top_heading,
                 "top_pages": top_pages or None,
@@ -259,11 +345,7 @@ async def eval_retrieval(db, items: list[dict], top_k: int) -> list[dict]:
                     and top_heading == primary
                     and _doc_matches(top, expected)
                 ),
-                "page_at_1": bool(
-                    top
-                    and _doc_matches(top, expected)
-                    and page_matches(_hit_pages(top), expected["pages"])
-                ),
+                "page_at_1": _page_at_1(top, expected),
             }
         )
     return rows
@@ -322,6 +404,7 @@ async def eval_read_section(db, items: list[dict]) -> list[dict]:
             "kind": item["kind"],
             "node_id": node_id,
             "doc_id": doc_id,
+            "page_basis": expected["page_basis"],
             "citation_page_ok": None,
             "leak": None,
             "confidence": None,
@@ -340,17 +423,17 @@ async def eval_read_section(db, items: list[dict]) -> list[dict]:
             rows.append(row)
             continue
 
-        section_pages = _as_page_ranges(
-            [section.get("page_start"), section.get("page_end")]
-            if section.get("page_start") is not None
-            and section.get("page_end") is not None
-            else None
-        )
         if expected["pages"]:
-            row["citation_page_ok"] = page_matches(section_pages, expected["pages"])
+            section_pages = pages_for_basis(section, expected["page_basis"])
+            row["citation_page_ok"] = (
+                None
+                if section_pages is None
+                else page_matches(section_pages, expected["pages"])
+            )
 
         # Confidence / fallback are optional: round-03 adds them to
-        # read_section; a base without them reports None, never a crash.
+        # read_section. A base without them records None (= n/a); only rows
+        # that actually carry a value enter low_confidence_rate.
         row["confidence"] = section.get("citation_confidence")
         row["fallback"] = section.get("fallback", section.get("resolved_from"))
         content = section.get("content") or ""
@@ -395,15 +478,17 @@ async def eval_ask(db, items: list[dict]) -> list[dict]:
         if not expected["pages"]:
             continue
         answer = await ask_question(db, item["query"])
-        ok = any(
-            page_matches(_hit_pages(citation), expected["pages"])
+        judged = [
+            page_matches(pages, expected["pages"])
             for citation in answer.get("citations", [])
-        )
+            if (pages := pages_for_basis(citation, expected["page_basis"])) is not None
+        ]
         rows.append(
             {
                 "id": item["id"],
                 "kind": item["kind"],
-                "ask_page_ok": ok,
+                "page_basis": expected["page_basis"],
+                "ask_page_ok": any(judged) if judged else None,
                 "citations": len(answer.get("citations", [])),
             }
         )
@@ -424,11 +509,17 @@ def _mean(values: list) -> float | None:
 
 
 def _aggregate(rows: list[dict]) -> dict:
-    retrieval = [row["retrieval"] for row in rows if row.get("retrieval")]
+    # ``no_answer`` rows carry a retrieval row with scored=False; they are
+    # reported separately and never enter the retrieval denominators.
+    retrieval = [
+        row["retrieval"]
+        for row in rows
+        if row.get("retrieval") and row["retrieval"].get("scored", True)
+    ]
     reads = [row["read_section"] for row in rows if row.get("read_section")]
     asks = [row["ask"] for row in rows if row.get("ask")]
     return {
-        "queries": len(rows),
+        "queries": len(retrieval),
         "hit_at_k": _mean([r["hit_at_k"] for r in retrieval]),
         "primary_at_1": _mean([r["primary_at_1"] for r in retrieval]),
         "page_at_1": _mean([r["page_at_1"] for r in retrieval]),
@@ -521,7 +612,8 @@ def print_markdown(report: dict) -> None:
     print()
     print(f"- db: `{report['db']}`")
     print(f"- top_k: {report['top_k']}")
-    print(f"- generated_at: {report['generated_at']}")
+    if report.get("generated_at"):
+        print(f"- generated_at: {report['generated_at']}")
     print()
     print("| metric | value |")
     print("| --- | --- |")
@@ -560,6 +652,17 @@ def print_markdown(report: dict) -> None:
             )
             + " |"
         )
+    no_answer_rows = report.get("no_answer_rows") or []
+    if no_answer_rows:
+        print()
+        print("## no_answer rows (not scored)")
+        print("| id | query | empty_reason | results |")
+        print("| --- | --- | --- | --- |")
+        for row in no_answer_rows:
+            print(
+                f"| {row['id']} | {row['query']} | "
+                f"{row.get('empty_reason') or 'n/a'} | {row.get('result_count')} |"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +685,12 @@ def _parse_fail_under(specs: list[str] | None) -> dict[str, float]:
 
 
 async def _run_retrieval(
-    db_path: Path, golden_path: Path, items: list[dict], top_k: int
+    db_path: Path,
+    golden_path: Path,
+    items: list[dict],
+    top_k: int,
+    run_ask: bool = True,
+    timestamp: bool = True,
 ) -> dict:
     engine = make_engine(db_path)
     try:
@@ -591,21 +699,41 @@ async def _run_retrieval(
         async with Session() as db:
             retrieval_rows = await eval_retrieval(db, items, top_k)
             read_rows = await eval_read_section(db, items)
-            ask_rows = await eval_ask(db, items)
+            ask_rows = await eval_ask(db, items) if run_ask else []
     finally:
         await engine.dispose()
 
     merged = merge_rows(retrieval_rows, read_rows, ask_rows)
     summary = summarize(merged)
-    return {
+    no_answer_rows = [
+        {
+            "id": row["id"],
+            "query": row["query"],
+            "kind": row["kind"],
+            "empty_reason": row.get("empty_reason"),
+            "result_count": row.get("result_count"),
+        }
+        for row in retrieval_rows
+        if row.get("scored") is False
+    ]
+    report = {
         "db": str(db_path),
         "golden": str(golden_path),
         "top_k": top_k,
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "totals": summary["totals"],
-        "by_kind": summary["by_kind"],
-        "rows": merged,
     }
+    if timestamp:
+        report["generated_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+    report.update(
+        {
+            "totals": summary["totals"],
+            "by_kind": summary["by_kind"],
+            "no_answer_rows": no_answer_rows,
+            "rows": merged,
+        }
+    )
+    return report
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -618,6 +746,16 @@ def _build_parser() -> argparse.ArgumentParser:
     retrieval.add_argument("--top-k", type=int, default=5)
     retrieval.add_argument("--out", default=None)
     retrieval.add_argument("--json", action="store_true")
+    retrieval.add_argument(
+        "--no-ask",
+        action="store_true",
+        help="skip the optional ask metrics (no repeated retrieval per item)",
+    )
+    retrieval.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="omit generated_at from the report for byte-for-byte diffs",
+    )
     retrieval.add_argument(
         "--fail-under",
         action="append",
@@ -669,7 +807,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = asyncio.run(
-            _run_retrieval(db_path, golden_path, items, max(1, args.top_k))
+            _run_retrieval(
+                db_path,
+                golden_path,
+                items,
+                max(1, args.top_k),
+                run_ask=not args.no_ask,
+                timestamp=not args.no_timestamp,
+            )
         )
     except Exception as exc:  # DB open / query failure
         print(f"db error: {type(exc).__name__}: {exc}", file=sys.stderr)
