@@ -1,37 +1,21 @@
 # Toc Memex
 
-**Toc Memex — a local-first AI memory over your documents.**
+> **PageIndex is a smart reader. Toc Memex is a library with a circulation
+> desk — every agent's reads, citations, and corrections stay on the page.**
 
-Toc Memex turns a folder of PDFs, Word files, Markdown, spreadsheets and images into a
-queryable library: OCR / text extraction → table of contents → chunks → SQLite FTS5
-BM25, with a web UI, an MCP server, cited search and hand-off notes for agents.
+- Multiple agents share one local library instead of each rebuilding its own.
+- Reads, citations, notes and corrections are anchored to the page they came from.
+- The next agent starts from what the last one left, not from zero.
 
-It is deliberately generic: no document domain is hard-coded. Section numbers,
-document numbers, chapter/appendix structure and print-page mapping are handled by
-neutral rules; any domain vocabulary is supplied by you through configuration.
+The library and retrieval run locally. Scanned files can use OCR — a cloud
+provider by default, local providers supported.
 
-## What it does
+## See it
 
-- **Ingest** — PDF text layer first, OCR fallback (PaddleOCR-VL, Mistral OCR,
-  MinerU, Azure Document Intelligence); DOCX/DOC through Word COM; Markdown and TXT;
-  XLSX / CSV / TSV as one TOC node per sheet; images via OCR.
-- **Structure** — rebuilds a TOC from printed contents, PDF bookmarks, Word heading
-  styles or OCR paragraph titles; maps printed page labels to PDF pages; validates the
-  tree and flags unplaced or duplicate nodes.
-- **Search** — SQLite FTS5 BM25 with jieba segmentation, section-number routing
-  (`8.3`), document-number routing (`ACME 100`), a title channel, and an optional
-  synonym dictionary.
-- **Topic collections** — optional partitions (`collections`) with agent-facing
-  descriptions; scoped search and a miss hint that names the collections that do have
-  hits.
-- **Agent surfaces** — MCP tools for overview, documents, TOC, sections, resources,
-  search, ask, tasks, notes, lessons and scores; a built-in console agent; a curator
-  that proposes maintenance ops with evidence. External MCP work is archived on the
-  **任务** page as grouped 外部会话 tasks (same client within 30 minutes share one;
-  `run_start` names/splits a task, `run_end` closes it), not in the built-in
-  console history.
-- **Web UI** — Vue 3 + Vite + Pinia. Library, document workspace, search, quality,
-  jobs, tasks, notes, agent console, model/OCR endpoints and settings.
+A 60-second demo: ingest a paper folder, ask for a comparison, get every
+sentence cited to a page, then leave one erratum that a second session picks
+up. The shot list lives in [`docs/demo.md`](docs/demo.md); the recording is
+pending.
 
 ## Requirements
 
@@ -72,6 +56,66 @@ MCP client config:
   }
 }
 ```
+
+## What it does
+
+- **Ingest** — PDF text layer first, OCR fallback (PaddleOCR-VL, Mistral OCR,
+  MinerU, Azure Document Intelligence); DOCX/DOC through Word COM; Markdown and TXT;
+  XLSX / CSV / TSV as one TOC node per sheet; images via OCR.
+- **Structure** — rebuilds a TOC from printed contents, PDF bookmarks, Word heading
+  styles or OCR paragraph titles; maps printed page labels to PDF pages; validates the
+  tree and flags unplaced or duplicate nodes.
+- **Search** — SQLite FTS5 BM25 with jieba segmentation, section-number routing
+  (`8.3`), document-number routing (`ACME 100`), a TOC-title channel, title-echo
+  promotion, and an optional synonym dictionary. No vector search.
+- **Library record** — every read, citation, note, task and correction is written
+  against a page; collections, hand-off notes and external-agent sessions are part of
+  the same record.
+- **Repair** — quality signals become evidence-backed proposals; a curator checks
+  them, and changes can be rolled back against the backup.
+
+The core is deliberately generic: no document domain is hard-coded. Section
+numbers, document numbers, chapter/appendix structure and print-page mapping
+are handled by neutral rules; any domain vocabulary is supplied by you through
+configuration.
+
+The web UI adds a library, document workspace, search, quality, jobs, tasks,
+notes, agent console, model/OCR endpoints and settings.
+
+## Second screen: Chinese annual reports
+
+The same product, with a different preset, eval set and demo, will cover
+Chinese A-share annual reports. Same code, different configuration — not a
+second product, and not part of the first release story.
+
+## Benchmark
+
+Retrieval and page-citation benchmark on five documents, 16 hand-checked
+questions, deterministic and LLM-free. Every number comes from a committed
+report in [`benchmarks/papers/`](benchmarks/papers/README.md).
+
+| metric | value |
+| --- | --- |
+| hit@k | 68.75% |
+| page@1 | 50.00% |
+| citation_page_rate | 100.00% |
+| citation_leak_rate | 0.00% |
+| MRR | 0.5781 |
+
+Method, failure cases and limitations: [`docs/benchmark-papers.md`](docs/benchmark-papers.md).
+Reproduce:
+
+```bash
+python scripts/run_eval.py retrieval \
+  --db data/eval/spike.db \
+  --golden benchmarks/papers/golden.jsonl
+```
+
+## Docs
+
+Start at [`docs/README.md`](docs/README.md). OCR providers are documented in
+[`docs/ocr-providers.md`](docs/ocr-providers.md).
+
 
 ## Quick start (development)
 
