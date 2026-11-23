@@ -449,8 +449,10 @@ export function startRun({ question, allowNotes = true, priorRunId = null, maxCa
   })
 }
 
-export function fetchRuns(limit = 20) {
-  return request(`/api/runs?limit=${limit}`)
+export function fetchRuns(limit = 20, source = '') {
+  const query = new URLSearchParams({ limit: String(limit) })
+  if (source) query.set('source', source)
+  return request(`/api/runs?${query}`)
 }
 
 export function fetchRun(id) {

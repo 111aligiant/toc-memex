@@ -863,6 +863,7 @@ def run_out(run: AgentRun, steps: list[AgentStep] | None = None) -> dict:
         "status": run.status,
         "source": run.source or "console",
         "client": run.client,
+        "taskId": run.task_id,
         "sessionId": run.session_id,
         "lastSeenAt": run.last_seen_at,
         "endpoint": run.endpoint,

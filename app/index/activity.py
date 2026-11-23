@@ -469,6 +469,22 @@ async def task_timeline(
         .scalars()
         .all()
     )
+    # External MCP runs file their call trace under the task. The trace is
+    # not the archive (the timeline above is), but the web page links to it
+    # so a session can still be inspected step by step.
+    from ..agent.models import AgentRun
+
+    runs = list(
+        (
+            await db.execute(
+                select(AgentRun)
+                .where(AgentRun.task_id == task_id)
+                .order_by(AgentRun.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
 
     doc_ids = {
         row.doc_id for row in [*activities, *notes] if row.doc_id is not None
@@ -543,15 +559,28 @@ async def task_timeline(
             "id": task.id,
             "title": task.title,
             "goal": task.goal,
+            "kind": task.kind,
             "status": task.status,
             "owner": task.owner_agent,
             "createdAt": task.created_at,
             "updatedAt": task.updated_at,
         },
+        "runs": [
+            {
+                "id": run.id,
+                "question": run.question,
+                "status": run.status,
+                "client": run.client,
+                "createdAt": run.created_at,
+                "finishedAt": run.finished_at,
+            }
+            for run in runs
+        ],
         "timeline": timeline,
         "counts": {
             "activities": len(activities),
             "notes": len(notes),
+            "runs": len(runs),
             "total": len(activities) + len(notes),
         },
     }

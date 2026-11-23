@@ -475,6 +475,7 @@ function openDoc(docId, tab = 'quality') {
               <div v-for="task in openTasks" :key="task.id" class="task-line">
                 <div class="task-top">
                   <span class="tstatus" :class="task.status">{{ TASK_STATUS[task.status] }}</span>
+                  <span v-if="task.kind === 'session'" class="tkind">外部</span>
                   <span class="task-title">{{ task.title }}</span>
                 </div>
                 <div class="task-meta">{{ task.owner || '未指派' }} · 更新于 {{ relTime(task.updatedAt) }}</div>
@@ -491,6 +492,7 @@ function openDoc(docId, tab = 'quality') {
                   <div v-for="task in doneTasks" :key="task.id" class="task-line done">
                     <div class="task-top">
                       <span class="tstatus done">{{ TASK_STATUS.done }}</span>
+                      <span v-if="task.kind === 'session'" class="tkind">外部</span>
                       <span class="task-title">{{ task.title }}</span>
                     </div>
                     <div class="task-meta">{{ task.owner || '未指派' }} · {{ relTime(task.updatedAt) }}</div>
@@ -892,6 +894,15 @@ function openDoc(docId, tab = 'quality') {
 }
 
 /* ── tasks ─────────────────────────────────────────────────── */
+.tkind {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex: none;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
 .task-line { padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .task-line:last-child { border-bottom: 0; }
 .task-top { display: flex; align-items: baseline; gap: 7px; }

@@ -9,7 +9,7 @@
  * a finished run replayable after a reload.
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { onBeforeRouteLeave, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import {
   cancelRun,
   fetchNotes,
@@ -30,6 +30,7 @@ import UiPanel from '@/components/ui/UiPanel.vue'
 import UiSeg from '@/components/ui/UiSeg.vue'
 
 const router = useRouter()
+const route = useRoute()
 
 const question = ref('')
 const allowNotes = ref(true)
@@ -375,7 +376,10 @@ async function refresh(id) {
 
 async function loadHistory(quiet = false) {
   try {
-    runs.value = (await fetchRuns(20)).runs
+    // The test bench is for the built-in agent. External MCP sessions are
+    // archived as tasks on the 任务 page; their trace is opened on demand
+    // from there (via ?run=), not listed here.
+    runs.value = (await fetchRuns(20, 'console')).runs
   } catch (err) {
     if (!quiet) error.value = err.message
   }
@@ -700,11 +704,17 @@ async function stopRun() {
 
 onMounted(() => {
   loadHistory()
+  if (route.query.run) {
+    // 任务 → 会话记录 links here with an external run id. Opening it is a
+    // trace inspection, not a history entry.
+    openRun({ id: String(route.query.run) })
+    return
+  }
   // Restore the run a citation jump interrupted, then keep polling it if live.
   const saved = readSavedView()
   if (saved?.runId) restoreView(saved)
-  // External MCP sessions open runs from another process; refresh the
-  // history so they appear without a manual reload.
+  // New console runs are started from this page; refresh so a run opened in
+  // another tab shows up without a manual reload.
   historyTimer = setInterval(() => loadHistory(true), 5000)
 })
 onBeforeRouteLeave(() => {
@@ -721,7 +731,7 @@ onBeforeUnmount(() => {
     <div class="page-head">
       <div>
         <h1>测试台</h1>
-        <p>看 agent 在你的档案里检索、阅读、回答，并留下手记。</p>
+        <p>看内置 agent 在你的档案里检索、阅读、回答，并留下手记。外部 MCP agent 的会话记录归档在「任务」页。</p>
       </div>
       <div class="page-head-actions">
         <UiChip v-if="run" :tone="runTone">{{ runLabel }}</UiChip>

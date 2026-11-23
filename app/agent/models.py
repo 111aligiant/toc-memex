@@ -40,6 +40,10 @@ class AgentRun(Base):
         String(80), nullable=True, index=True
     )
     client: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # The activity-layer task this run belongs to. Console runs answer a
+    # question for the operator; an external MCP run is *work*, so it is
+    # archived as a task and only its trace lives here. See external.py.
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     endpoint: Mapped[str | None] = mapped_column(String(120), nullable=True)
     model: Mapped[str | None] = mapped_column(String(120), nullable=True)
     allow_notes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

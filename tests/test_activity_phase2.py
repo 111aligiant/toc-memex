@@ -541,7 +541,7 @@ async def test_task_timeline_merges_handoff_notes(tmp_path):
 
         payload = await task_timeline(db, task.id)
         assert payload is not None
-        assert payload["counts"] == {"activities": 1, "notes": 1, "total": 2}
+        assert payload["counts"] == {"activities": 1, "notes": 1, "runs": 0, "total": 2}
         assert {item["source"] for item in payload["timeline"]} == {"activity", "note"}
         handoff = next(item for item in payload["timeline"] if item["source"] == "note")
         assert handoff["kind"] == "handoff"

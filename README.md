@@ -26,7 +26,10 @@ neutral rules; any domain vocabulary is supplied by you through configuration.
   hits.
 - **Agent surfaces** — MCP tools for overview, documents, TOC, sections, resources,
   search, ask, tasks, notes, lessons and scores; a built-in console agent; a curator
-  that proposes maintenance ops with evidence.
+  that proposes maintenance ops with evidence. External MCP work is archived on the
+  **任务** page as grouped 外部会话 tasks (same client within 30 minutes share one;
+  `run_start` names/splits a task, `run_end` closes it), not in the built-in
+  console history.
 - **Web UI** — Vue 3 + Vite + Pinia. Library, document workspace, search, quality,
   jobs, tasks, notes, agent console, model/OCR endpoints and settings.
 

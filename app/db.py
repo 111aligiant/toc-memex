@@ -188,6 +188,14 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
     await _add_column_if_missing(conn, "agent_runs", "session_id", "VARCHAR(80)")
     await _add_column_if_missing(conn, "agent_runs", "client", "VARCHAR(120)")
     await _add_column_if_missing(conn, "agent_runs", "last_seen_at", "VARCHAR(40)")
+    # External runs belong to an activity-layer task (see app/agent/external.py).
+    if await _add_column_if_missing(conn, "agent_runs", "task_id", "VARCHAR(36)"):
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_agent_runs_task_id "
+                "ON agent_runs (task_id)"
+            )
+        )
     # Per-run token ceiling; 0 = the built-in default in app.agent.runner.
     await _add_column_if_missing(conn, "agent_runs", "max_tokens", "INTEGER NOT NULL DEFAULT 0")
     await conn.execute(

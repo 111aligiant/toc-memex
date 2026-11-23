@@ -1240,3 +1240,168 @@ async def test_cancelled_run_survives_a_late_exception(tmp_path, monkeypatch):
     run, _steps = await load_run(engine, run_id)
     assert run.status == "cancelled"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_external_calls_are_filed_under_a_session_task(tmp_path, monkeypatch):
+    """An external MCP read must land in the activity layer, not only in the
+    console run: the task owns the read, and the run points at the task."""
+    db_path = await seed(tmp_path)
+    _patch_mcp_session(monkeypatch, db_path)
+    from app import mcp_server
+
+    result = await mcp_server.server.call_tool(
+        "read_section",
+        {"doc_id": "doc1", "node_id": "d:8.3", "actor_agent": "claude-code"},
+    )
+    assert result.is_error is False
+
+    from app.index.activity import Activity, Task
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        task = (await db.execute(select(Task))).scalars().one()
+        assert task.kind == "session"
+        assert task.owner_agent == "claude-code"
+        assert task.status == "doing"
+        run = (await db.execute(select(AgentRun))).scalars().one()
+        assert run.task_id == task.id
+        activity = (await db.execute(select(Activity))).scalars().one()
+        assert activity.task_id == task.id
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_new_connection_from_the_same_client_reuses_the_task(
+    tmp_path, monkeypatch
+):
+    """DSH opens a fresh MCP connection per call; consecutive calls from the
+    same client still belong to one 外部会话 task."""
+    db_path = await seed(tmp_path)
+    _patch_mcp_session(monkeypatch, db_path, session_id="sess-1")
+    from app import mcp_server
+
+    await mcp_server.server.call_tool("search", {"query": "振动"})
+    monkeypatch.setattr(mcp_server, "_session_id", lambda ctx: "sess-2")
+    await mcp_server.server.call_tool("search", {"query": "盐雾"})
+
+    from app.index.activity import Task
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        tasks = (await db.execute(select(Task))).scalars().all()
+        assert len(tasks) == 1
+        runs = (await db.execute(select(AgentRun))).scalars().all()
+        assert len(runs) == 2
+        assert {run.task_id for run in runs} == {tasks[0].id}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_start_opens_a_named_task_and_run_end_closes_it(
+    tmp_path, monkeypatch
+):
+    db_path = await seed(tmp_path)
+    _patch_mcp_session(monkeypatch, db_path)
+    from app import mcp_server
+    from app.index.activity import Task
+
+    started = await mcp_server.server.call_tool(
+        "run_start", {"question": "整理 8.3 的振动要求"}
+    )
+    assert started.is_error is False
+    await mcp_server.server.call_tool("search", {"query": "8.3 振动"})
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        task = (await db.execute(select(Task))).scalars().one()
+        assert task.title == "整理 8.3 的振动要求"
+        assert task.status == "doing"
+    await engine.dispose()
+
+    ended = await mcp_server.server.call_tool(
+        "run_end", {"status": "done", "answer": "已完成。"}
+    )
+    assert ended.is_error is False
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        task = (await db.execute(select(Task))).scalars().one()
+        assert task.status == "done"
+        run = (await db.execute(select(AgentRun))).scalars().one()
+        assert run.task_id == task.id
+    await engine.dispose()
+
+
+def test_console_history_excludes_external_runs(tmp_path, monkeypatch):
+    db_path = asyncio.run(seed(tmp_path))
+    _patch_mcp_session(monkeypatch, db_path)
+    from app import mcp_server
+
+    asyncio.run(mcp_server.server.call_tool("search", {"query": "振动"}))
+
+    app = create_app(db_path, tmp_path)
+    with TestClient(app) as client:
+        history = client.get("/api/runs?source=console").json()["runs"]
+        assert history == []
+        all_runs = client.get("/api/runs").json()["runs"]
+        assert len(all_runs) == 1 and all_runs[0]["source"] == "mcp"
+        assert all_runs[0]["taskId"]
+        tasks = client.get("/api/tasks").json()["tasks"]
+        assert len(tasks) == 1
+        assert tasks[0]["kind"] == "session"
+
+
+@pytest.mark.asyncio
+async def test_backfill_files_legacy_external_runs_and_their_records(tmp_path):
+    """Runs recorded before task filing existed are grouped into a session
+    task, and the reads/notes they already wrote are attached to it."""
+    from app.agent.external import backfill_external_tasks
+    from app.index.activity import Activity, Task
+
+    db_path = await seed(tmp_path)
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        run = AgentRun(
+            question="盐雾试验多久？",
+            status="done",
+            source="mcp",
+            session_id="sess-old",
+            client="old-client",
+        )
+        db.add(run)
+        await db.flush()
+        db.add(
+            Activity(
+                kind="read",
+                actor_agent="old-client",
+                session_id="sess-old",
+                doc_id="doc1",
+            )
+        )
+        db.add(
+            AgentNote(
+                author="old-client",
+                kind="handoff",
+                body="旧会话留下的交接",
+                session_id="sess-old",
+            )
+        )
+        await db.commit()
+        run_id = run.id
+
+    assert await backfill_external_tasks(engine) == 1
+    async with session_factory(engine)() as db:
+        task = (await db.execute(select(Task))).scalars().one()
+        assert task.kind == "session"
+        assert task.status == "done"
+        assert task.title == "盐雾试验多久？"
+        run = await db.get(AgentRun, run_id)
+        assert run.task_id == task.id
+        activity = (await db.execute(select(Activity))).scalars().one()
+        assert activity.task_id == task.id
+        note = (await db.execute(select(AgentNote))).scalars().one()
+        assert note.task_id == task.id
+    # Idempotent: a second sweep has nothing left to file.
+    assert await backfill_external_tasks(engine) == 0
+    await engine.dispose()

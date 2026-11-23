@@ -123,6 +123,28 @@ def _session_id(ctx: Context | None) -> str | None:
     return assigned
 
 
+async def _task_id_for(
+    db: AsyncSession, ctx: Context | None, explicit: str, question: str = ""
+) -> str | None:
+    """Task an external write belongs to: explicit, else the session's task.
+
+    The console (bridge) has no activity-layer task of its own, so it keeps
+    whatever the caller passed. For an external connection this makes reads,
+    notes and errata land on the 任务 page without the agent having to repeat
+    task_id on every call.
+    """
+    if explicit:
+        return explicit
+    if _bridge() is not None:
+        return None
+    return await _external.session_task_id(
+        db,
+        session_id=_log_session_id(ctx),
+        client=_client_name(ctx),
+        question=question,
+    )
+
+
 def _client_name(ctx: Context | None) -> str | None:
     """The client's self-declared name from the MCP handshake.
 
@@ -163,6 +185,18 @@ def observed(fn):
         client = _client_name(ctx)
         call_args = {key: value for key, value in kwargs.items() if key != "ctx"}
         settings = get_settings()
+        # Open the run *before* the tool body: the body stamps task_id on its
+        # activity rows, and the run owns the task the call belongs to.
+        try:
+            await _external.ensure_run(
+                settings,
+                session_id=session_id,
+                client=client,
+                tool=fn.__name__,
+                args=call_args,
+            )
+        except Exception:
+            pass
         guard = guard_for(
             str(settings.tocmemex_db_path), session_id, max_entries=64
         )
@@ -250,6 +284,10 @@ async def _get_cached_engine(db_path: Path) -> "_CachedEngine":
             _ENGINE_CACHE[key] = entry
         if not entry.schema_ready:
             await ensure_schema(entry.engine)
+            try:
+                await _external.backfill_external_tasks(entry.engine)
+            except Exception:
+                pass
             entry.schema_ready = True
         return entry
 
@@ -443,7 +481,9 @@ async def read_section(
                 max_chars=max_chars,
                 cursor=cursor,
                 reader_agent=actor_agent or None,
-                task_id=task_id or None,
+                task_id=await _task_id_for(
+                    db, ctx, task_id, f"读取 {doc_id} · {node_id}"
+                ),
                 session_id=_log_session_id(ctx),
             )
         except ValueError as exc:
@@ -555,7 +595,9 @@ async def read_resource(
                     db,
                     "read",
                     actor_agent,
-                    task_id=task_id or None,
+                    task_id=await _task_id_for(
+                        db, ctx, task_id, f"读取资源 {doc_id} · {resource_id}"
+                    ),
                     doc_id=doc_id,
                     node_id=payload.get("node_id"),
                     session_id=_log_session_id(ctx),
@@ -646,7 +688,7 @@ async def search(
             await _activity.usage_log_write(
                 db, query, "search", hits,
                 actor_agent=actor_agent or None,
-                task_id=task_id or None,
+                task_id=await _task_id_for(db, ctx, task_id, query),
             )
         except Exception:
             pass  # logging must never break retrieval
@@ -706,7 +748,7 @@ async def ask(
             await _activity.usage_log_write(
                 db, question, "ask", hits,
                 actor_agent=actor_agent or None,
-                task_id=task_id or None,
+                task_id=await _task_id_for(db, ctx, task_id, question),
             )
         except Exception:
             pass
@@ -744,14 +786,19 @@ async def mark_used(
     from sqlalchemy import update
 
     async with _session() as db:
+        values = {"used": 1, "actor_agent": actor_agent or None}
+        # Do not clear a task_id the search already stamped: only overwrite
+        # it when this caller names one (or the session supplies its task).
+        effective_task = await _task_id_for(db, ctx, task_id, "标记使用")
+        if effective_task:
+            values["task_id"] = effective_task
         stmt = (
             update(_activity.UsageLog)
             .where(
                 _activity.UsageLog.chunk_id == chunk_id,
                 _activity.UsageLog.used == 0,
             )
-            .values(used=1, actor_agent=actor_agent or None,
-                    task_id=task_id or None)
+            .values(**values)
         )
         result = await db.execute(stmt)
         await db.commit()
@@ -773,18 +820,24 @@ async def run_start(
     prior_run_id: str = "",
     allow_notes: bool = True,
     max_calls: int = 8,
+    task_id: str = "",
     ctx: Context | None = None,
 ) -> dict:
-    """Open a run in the Memex console for this connection.
+    """Open a task for this connection and name the work.
 
-    Call this when you start a task so the console can name the work and
-    group every following search / read / note under it. One connection
-    owns at most one running run; starting another closes the previous one.
-    The run id is informational — later tool calls are attributed by the
-    server-assigned session, not by passing the id around.
+    Call this when you start a task: every following search / read / note is
+    filed under it, and the task appears on the Memex 任务 page (not the
+    test bench). Pass task_id to attach the run to a task you created with
+    task_create(); omit it and a new "外部会话" task is opened with this
+    question as its title. One connection owns at most one running run;
+    starting another closes the previous one and its task. The run id is
+    informational — later calls are attributed by the server-assigned
+    session, not by passing the id around.
     """
     client = _client_name(ctx) or actor_agent or None
     async with _session() as db:
+        if task_id and await db.get(Task, task_id) is None:
+            raise _tool_error(ValueError(f"task not found: {task_id}"))
         run = await _external.start_run(
             db,
             session_id=_session_id(ctx),
@@ -793,10 +846,12 @@ async def run_start(
             allow_notes=allow_notes,
             max_calls=max_calls,
             prior_run_id=prior_run_id or None,
+            task_id=task_id or None,
         )
         await db.commit()
         return {
             "run_id": run.id,
+            "task_id": run.task_id,
             "question": run.question,
             "status": run.status,
             "session_id": run.session_id,
@@ -834,6 +889,7 @@ async def run_end(
             return {"error": "这个连接没有进行中的 run"}
         return {
             "run_id": run.id,
+            "task_id": run.task_id,
             "status": run.status,
             "answer": run.answer,
             "error": run.error,
@@ -863,7 +919,7 @@ async def lesson_write(
             db, trigger, issue, solution,
             author_agent=actor_agent,
             keywords=keywords or None,
-            task_id=task_id or None,
+            task_id=await _task_id_for(db, ctx, task_id, trigger),
             doc_id=doc_id or None,
             author_session=_log_session_id(ctx),
         )
@@ -964,6 +1020,10 @@ async def add_note(
             parent = await db.get(AgentNote, reply_to)
             if parent is not None and parent.task_id:
                 task_id = parent.task_id
+        if not task_id:
+            task_id = await _task_id_for(
+                db, ctx, task_id, body.splitlines()[0][:200]
+            ) or ""
         if task_id and await db.get(Task, task_id) is None:
             raise ToolError(f"task not found: {task_id}")
         row = AgentNote(
@@ -1178,7 +1238,9 @@ async def activity_write(
             kind,
             actor_agent,
             content=content or None,
-            task_id=task_id or None,
+            task_id=await _task_id_for(
+                db, ctx, task_id, (content or "").splitlines()[0][:200] if content else ""
+            ),
             doc_id=doc_id or None,
             node_id=node_id or None,
             chunk_id=chunk_id,

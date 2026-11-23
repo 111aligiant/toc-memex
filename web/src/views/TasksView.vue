@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useTasksStore } from '@/stores/quality'
 import { fetchTaskDetail } from '@/api'
 import { absTime, relTime } from '@/utils/format'
@@ -16,6 +17,7 @@ import UiSeg from '@/components/ui/UiSeg.vue'
  * 和「解析队列」不是一回事：解析队列是文档状态派生出来的入库任务。
  */
 const tasksStore = useTasksStore()
+const router = useRouter()
 const filter = ref('active')
 
 const expandedId = ref(null)
@@ -87,6 +89,28 @@ function anchorLabel(item) {
   if (doc && path) return `《${doc}》 › ${path}`
   return doc ? `《${doc}》` : path
 }
+
+/** External MCP call traces filed under this task (newest first, capped). */
+const detailRuns = computed(() => [...(detail.value?.runs || [])].reverse().slice(0, 6))
+
+const RUN_STATUS = {
+  running: '运行中',
+  done: '完成',
+  failed: '失败',
+  cancelled: '已取消',
+  queued: '排队中',
+}
+
+/** An old session's run often has no run_end; do not show it as live on a
+ *  task that is already closed. */
+function runState(run) {
+  if (run.status === 'running' && detail.value?.task?.status === 'done') return '已结束'
+  return RUN_STATUS[run.status] || run.status
+}
+
+function openRun(runId) {
+  router.push({ path: '/agent', query: { run: runId } })
+}
 </script>
 
 <template>
@@ -94,7 +118,7 @@ function anchorLabel(item) {
     <div class="page-head">
       <div>
         <h1>任务</h1>
-        <p>agent 通过 MCP 建的工作单元，跨会话交接。展开一行看它下面发生过什么。</p>
+        <p>agent 的工作单元，跨会话交接。外部 MCP agent 的调用会自动归到「外部会话」任务；展开一行看读过什么、留下了什么。</p>
       </div>
       <UiSeg v-model="filter" :items="filters" />
     </div>
@@ -105,6 +129,7 @@ function anchorLabel(item) {
           <div class="task-row" :class="{ open: expandedId === task.id }" @click="toggle(task)">
             <div class="task-top">
               <span class="tstatus" :class="task.status">{{ STATUS[task.status] || task.status }}</span>
+              <span v-if="task.kind === 'session'" class="tkind">外部会话</span>
               <span class="task-title">{{ task.title }}</span>
               <span class="task-chevron" :class="{ open: expandedId === task.id }">
                 <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>
@@ -124,7 +149,7 @@ function anchorLabel(item) {
               v-else-if="detail && !detail.timeline.length"
               compact
               title="这个任务下还没有记录"
-              hint="agent 读资料、提勘误、写交接时会带 task_id 自动挂上来。"
+              hint="agent 读资料、提勘误、写交接时会自动挂到当前任务上。"
             />
             <ol v-else-if="detail" class="timeline">
               <li v-for="item in detail.timeline" :key="`${item.source}-${item.id}`" class="tl-item">
@@ -143,6 +168,23 @@ function anchorLabel(item) {
                 </div>
               </li>
             </ol>
+            <div v-if="detail?.runs?.length" class="run-links">
+              <div class="runs-head">
+                会话记录 {{ detail.counts.runs }} 段
+                <span v-if="detailRuns.length < detail.counts.runs">· 最近 {{ detailRuns.length }} 段</span>
+              </div>
+              <button
+                v-for="run in detailRuns"
+                :key="run.id"
+                type="button"
+                class="run-link"
+                @click="openRun(run.id)"
+              >
+                <span class="run-q">{{ run.question }}</span>
+                <span class="run-state" :class="run.status">{{ runState(run) }}</span>
+                <span class="run-time">{{ relTime(run.createdAt) }}</span>
+              </button>
+            </div>
             <div v-if="detail" class="detail-foot">
               {{ detail.counts.total }} 条记录 · {{ detail.counts.activities }} 条活动 ·
               {{ detail.counts.notes }} 条手记
@@ -153,7 +195,7 @@ function anchorLabel(item) {
       <UiEmpty
         v-else
         :title="filter === 'active' ? '没有未完成的任务' : '没有任务'"
-        hint="agent 通过 MCP 的 task_create() 建任务后会出现在这里。"
+        hint="外部 MCP agent 一调用就会自动归入「外部会话」任务；agent 也可以用 task_create() 自己建任务。"
       />
     </div>
   </section>
@@ -184,6 +226,15 @@ function anchorLabel(item) {
 .tstatus.blocked { color: var(--danger); background: var(--danger-soft); }
 .tstatus.done { color: var(--ok); background: var(--ok-soft); }
 .tstatus.archived { color: var(--faint); background: var(--pill); }
+.tkind {
+  font-size: 9.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex: none;
+  color: var(--muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
 
 .task-detail { padding: 0 16px 14px 16px; background: var(--surface-2); }
 .detail-note { font-size: 11.5px; color: var(--faint); padding: 10px 0; }
@@ -213,5 +264,28 @@ function anchorLabel(item) {
 .tl-text { font-size: 11.5px; color: var(--muted); line-height: 1.65; margin-top: 2px; white-space: pre-line; }
 .tl-text.faint { color: var(--faint); font-style: italic; }
 .tl-anchor { font-size: 10px; color: var(--faint); margin-top: 3px; }
+.run-links { padding-top: 10px; }
+.runs-head { font-size: 10.5px; color: var(--faint); margin-bottom: 4px; }
+.run-link {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.run-link:hover { background: var(--pill); }
+.run-q { flex: 1; min-width: 0; font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-state { flex: none; font-size: 9.5px; color: var(--faint); }
+.run-state.done { color: var(--ok); }
+.run-state.failed { color: var(--danger); }
+.run-state.running { color: var(--accent); }
+.run-time { flex: none; font-size: 10px; color: var(--faint); }
 .detail-foot { font-size: 10px; color: var(--faint); padding-top: 9px; }
 </style>

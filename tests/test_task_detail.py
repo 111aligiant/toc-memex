@@ -64,7 +64,7 @@ async def test_task_detail_merges_activities_and_notes(tmp_path):
         data = client.get("/api/tasks/t1").json()
 
     assert data["task"]["id"] == "t1"
-    assert data["counts"] == {"activities": 4, "notes": 1, "total": 5}
+    assert data["counts"] == {"activities": 4, "notes": 1, "runs": 0, "total": 5}
     kinds = [item["kind"] for item in data["timeline"]]
     assert kinds == ["read", "cite", "erratum", "review", "handoff"]
     # The note is merged in at its own timestamp, not appended out of order.

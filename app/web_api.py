@@ -872,6 +872,14 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     @app.on_event("startup")
     async def _startup() -> None:
         await ensure_schema()
+        # Legacy external MCP runs predate activity-layer tasks; file them
+        # once so the 任务 page is not empty for work already done.
+        from .agent.external import backfill_external_tasks
+
+        try:
+            await backfill_external_tasks(engine())
+        except Exception:
+            pass  # a migration must never keep the console from starting
         from .ingest.bench import fail_stale_processing_scenarios
 
         await fail_stale_processing_scenarios(session_factory(engine()))
@@ -2155,7 +2163,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         with closing(_connect(db_path)) as connection:
             rows = connection.execute(
                 """
-                SELECT id, title, goal, status, owner_agent, created_at, updated_at
+                SELECT id, title, goal, kind, status, owner_agent, created_at, updated_at
                 FROM tasks ORDER BY updated_at DESC LIMIT ?
                 """,
                 (max(1, min(limit, 200)),),
@@ -2165,6 +2173,9 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 "id": row["id"],
                 "title": row["title"],
                 "goal": row["goal"],
+                # "session" = an external MCP agent's automatically grouped
+                # work; the page labels it differently from agent-created tasks.
+                "kind": row["kind"] or "task",
                 "status": row["status"],
                 "owner": row["owner_agent"],
                 "createdAt": row["created_at"],
@@ -2855,19 +2866,22 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         return {"run": agent_run_out(run, [])}
 
     @app.get("/api/runs")
-    async def api_runs(limit: int = Query(default=20, ge=1, le=100)) -> dict:
+    async def api_runs(
+        limit: int = Query(default=20, ge=1, le=100),
+        source: str | None = Query(default=None),
+    ) -> dict:
+        """Run history, newest first.
+
+        ``source=console`` is what the test bench asks for: external MCP
+        sessions are work, archived as tasks on the 任务 page. Their runs
+        stay fetchable by id (the task page links to the trace) but are not
+        mixed into the test bench history.
+        """
         async with session_factory(engine())() as session:
-            rows = (
-                (
-                    await session.execute(
-                        sqlalchemy.select(AgentRun)
-                        .order_by(AgentRun.created_at.desc())
-                        .limit(limit)
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            stmt = sqlalchemy.select(AgentRun).order_by(AgentRun.created_at.desc())
+            if source:
+                stmt = stmt.where(AgentRun.source == source)
+            rows = (await session.execute(stmt.limit(limit))).scalars().all()
         return {"runs": [agent_run_out(row, []) for row in rows]}
 
     @app.get("/api/runs/{run_id}")
