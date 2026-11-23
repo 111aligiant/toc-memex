@@ -730,20 +730,38 @@ async def search(
     query: str,
     top_k: int = 8,
     collection: str = "",
+    mode: str = "auto",
+    filters: dict | None = None,
+    doc_ids: list[str] | None = None,
     actor_agent: str = "",
     task_id: str = "",
     ctx: Context | None = None,
 ) -> dict:
     """Section-first search with heading_path, page range, and chunk_ids.
 
-    Returns ``{"results": [...], "hint": str | null, "scope": {...}}``.
-    Every hit carries its ``collection`` ({"id","name"} or null when the
-    document is unfiled). Pass ``collection`` (id, exact name, or
-    "unassigned") to narrow the search to one topic area; an unknown value
-    falls back to a whole-library search and adds ``collection_note``
-    listing the valid collections. When a scoped search finds nothing,
-    ``hint`` names the collections that do have hits — re-run without the
-    filter or pick another.
+    Returns ``{"results", "hint", "hints", "next", "empty_reason",
+    "mode_requested", "mode_effective", "degraded", "mode_note", "filters",
+    "channels_used", "scope"}``. Every hit carries its ``collection``
+    ({"id","name"} or null when unfiled), the 0-based internal
+    ``page_start/page_end``, and the agent-facing ``pdf_page_start`` /
+    ``pdf_page_end`` (1-based PDF pages). Cite ``pdf_page_*``, not
+    ``page_start``. ``printed_page_*`` are null until printed labels are
+    stored.
+
+    ``mode`` is ``auto|lexical|semantic|hybrid``. Only lexical retrieval
+    exists, so ``semantic`` / ``hybrid`` run lexical and say so with
+    ``degraded=true`` and ``mode_note``.
+
+    ``filters`` accepts document metadata only: ``doc_type``, ``source``,
+    ``date_from``, ``date_to``, ``doc_ids``, ``doc_id`` (singular alias of
+    ``doc_ids``). Unknown keys raise an error. ``doc_ids`` here narrows to
+    those ids and intersects with ``filters``.
+
+    Pass ``collection`` (id, exact name, or "unassigned") to narrow to one
+    topic area; an unknown value falls back to a whole-library search and
+    adds ``collection_note`` listing the valid collections. ``empty_reason``
+    explains a zero-hit page (no_terms / collection_empty / filtered_out /
+    scoped_miss / no_match); ``hints`` and ``next`` say what to try next.
 
     Every search is usage-logged (query, hits, ranks) for relevance
     feedback; call mark_used() on the chunk_ids you actually rely on.
@@ -752,20 +770,44 @@ async def search(
     if not query:
         raise ToolError("query 不能为空")
     top_k = max(1, min(int(top_k or 8), 12))
+    mode_value = str(mode or "auto").strip().lower()
+    if mode_value not in ("auto", "lexical", "semantic", "hybrid"):
+        raise ToolError("mode 必须是 auto|lexical|semantic|hybrid")
+    if filters is not None and not isinstance(filters, dict):
+        raise ToolError("filters 必须是对象（dict）")
     async with _session() as db:
         try:
-            payload = await scoped_search(
-                db, query, top_k=top_k, collection=collection
-            )
-        except _collections.CollectionNotFound as exc:
-            # The model often derives a collection name from a document title.
-            # A dead end costs a turn and teaches nothing; a whole-library
-            # search still finds the document.
-            payload = await scoped_search(db, query, top_k=top_k, collection="")
-            valid = "、".join(name for name, _count in exc.valid[:10]) or "（无）"
-            payload["collection_note"] = (
-                f"未找到分区「{collection}」，已改为全库检索；可用分区：{valid}"
-            )
+            try:
+                payload = await scoped_search(
+                    db,
+                    query,
+                    top_k=top_k,
+                    collection=collection,
+                    doc_ids=doc_ids,
+                    filters=filters,
+                    mode=mode_value,
+                )
+            except _collections.CollectionNotFound as exc:
+                # The model often derives a collection name from a document
+                # title. A dead end costs a turn and teaches nothing; a
+                # whole-library search still finds the document.
+                payload = await scoped_search(
+                    db,
+                    query,
+                    top_k=top_k,
+                    collection="",
+                    doc_ids=doc_ids,
+                    filters=filters,
+                    mode=mode_value,
+                )
+                valid = "、".join(name for name, _count in exc.valid[:10]) or "（无）"
+                payload["collection_note"] = (
+                    f"未找到分区「{collection}」，已改为全库检索；可用分区：{valid}"
+                )
+        except ValueError as exc:
+            # Unknown filter key / bad filter value / bad mode from the
+            # core layer: surface the readable message as a tool error.
+            raise ToolError(str(exc)) from exc
         hits = payload["results"]
         try:
             await _activity.usage_log_write(
