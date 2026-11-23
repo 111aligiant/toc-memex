@@ -1,3 +1,13 @@
+"""MCP server and tool definitions.
+
+``TOCMEMEX_TOOLS=default|full`` picks the tool surface only for the server
+that ``main()`` starts: ``build_server(_active_profile())``. The module-level
+``server`` is always the complete (full) surface and is what the built-in
+console and tests use in-process; import it to call tools, but do not run it
+as the outside-facing server — start ``build_server(_active_profile())``
+instead.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -17,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .agent import external as _external
 from .agent.call_guard import REPLAY_NOTE, guard_for
-from .agent.instructions import FULL_INSTRUCTIONS
+from .agent.instructions import FULL_INSTRUCTIONS, instructions_for
 from .bindguard import enforce_bind_host
 from .config import get_settings
 from .db import ensure_schema, make_engine, session_factory
@@ -35,16 +45,78 @@ from .index import resources as _resources
 from .index.sections import read_section as _read_section
 from .models import AgentNote, Document
 
+PROFILE_DEFAULT = "default"
+PROFILE_FULL = "full"
+_PROFILES = {PROFILE_DEFAULT, PROFILE_FULL}
+
+# The 8-tool surface advertised to external agents by default. Everything
+# else is still implemented and reachable through the ``full`` profile.
+DEFAULT_TOOLS: frozenset[str] = frozenset({
+    "memex_overview",
+    "search",
+    "get_toc",
+    "read_section",
+    "add_note",
+    "mark_used",
+    "activity_write",
+    "propose_ops",
+})
+
+# (tool name, function, profile required to expose it). Filled while the
+# module imports; read only after import has finished.
+_REGISTRY: list[tuple[str, Callable[..., Any], str]] = []
+
+SERVER_DESCRIPTION = (
+    "Toc Memex: a local-first AI memory over your documents, with TOC "
+    "sections, cited search, extractive answers, and agent hand-off notes."
+)
+
+# Module-level server: always the complete surface. The built-in console
+# (``app.agent.surface``) and tests call this instance; the outside-facing
+# lifecycle is ``main()``, which starts ``build_server(_active_profile())``.
 server = MCPServer(
     "toc-memex",
     title="Toc Memex",
-    description=(
-        "Toc Memex: a local-first AI memory over your documents, with TOC "
-        "sections, cited search, extractive answers, and agent hand-off notes."
-    ),
+    description=SERVER_DESCRIPTION,
     instructions=FULL_INSTRUCTIONS,
     version="0.1.0",
 )
+
+
+def _active_profile() -> str:
+    """Profile selected by ``TOCMEMEX_TOOLS``; unknown values mean default."""
+    value = (get_settings().tocmemex_tools or PROFILE_DEFAULT).strip().lower()
+    return value if value in _PROFILES else PROFILE_DEFAULT
+
+
+def tool(*, name: str | None = None, profile: str = PROFILE_DEFAULT):
+    """Register a tool in the module server and the profile registry."""
+
+    def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+        tool_name = name or fn.__name__
+        _REGISTRY.append((tool_name, fn, profile))
+        server.tool(tool_name)(fn)
+        return fn
+
+    return deco
+
+
+def build_server(profile: str) -> MCPServer:
+    """Build a server exposing the tools of ``profile`` (default or full)."""
+    profile = (profile or PROFILE_DEFAULT).strip().lower()
+    if profile not in _PROFILES:
+        profile = PROFILE_DEFAULT
+    srv = MCPServer(
+        "toc-memex",
+        title="Toc Memex",
+        description=SERVER_DESCRIPTION,
+        instructions=instructions_for(profile),
+        version="0.1.0",
+    )
+    for tool_name, fn, required in _REGISTRY:
+        if profile == PROFILE_FULL or required == PROFILE_DEFAULT:
+            srv.tool(tool_name)(fn)
+    return srv
 
 
 @dataclass(frozen=True)
@@ -356,7 +428,7 @@ def _tool_error(exc: Exception) -> ToolError:
     return ToolError(str(exc))
 
 
-@server.tool()
+@tool()
 @observed
 async def memex_overview(ctx: Context | None = None) -> dict:
     """Show document counts, type distribution, recent documents, and the
@@ -364,7 +436,7 @@ async def memex_overview(ctx: Context | None = None) -> dict:
     return await _with_db(_memex_overview)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def overview(
     query: str = "",
@@ -378,7 +450,7 @@ async def overview(
     )
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def list_collections(ctx: Context | None = None) -> dict:
     """List the library's topic collections, with the description agents
@@ -402,7 +474,7 @@ async def list_collections(ctx: Context | None = None) -> dict:
     return await _with_db(_run)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def list_documents(
     query: str = "",
@@ -420,14 +492,14 @@ async def list_documents(
     )
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def get_document(doc_id: str, ctx: Context | None = None) -> dict:
     """Get document metadata, counts, and top-level TOC roots."""
     return await _with_db(lambda db: _get_document(db, doc_id))
 
 
-@server.tool()
+@tool()
 @observed
 async def get_toc(doc_id: str, depth: int = 2, ctx: Context | None = None) -> dict:
     """Get the TOC tree. depth=2 returns roots and their children."""
@@ -444,7 +516,7 @@ async def get_toc(doc_id: str, depth: int = 2, ctx: Context | None = None) -> di
     return await _with_db(_run)
 
 
-@server.tool()
+@tool()
 @observed
 async def read_section(
     doc_id: str,
@@ -526,7 +598,7 @@ async def read_section(
     return result
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def list_resources(
     doc_id: str,
@@ -564,7 +636,7 @@ async def list_resources(
     return await _with_db(_run)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def read_resource(
     doc_id: str,
@@ -641,7 +713,7 @@ async def read_resource(
     return content
 
 
-@server.tool()
+@tool()
 @observed
 async def search(
     query: str,
@@ -712,7 +784,7 @@ async def search(
     return payload
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 @observed
 async def ask(
     question: str,
@@ -771,7 +843,7 @@ async def ask(
     return result
 
 
-@server.tool()
+@tool()
 @observed
 async def mark_used(
     chunk_id: int,
@@ -813,7 +885,7 @@ async def mark_used(
 # adopted them still shows up.
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def run_start(
     question: str,
     actor_agent: str = "",
@@ -859,7 +931,7 @@ async def run_start(
         }
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def run_end(
     status: str = "done",
     answer: str = "",
@@ -899,7 +971,7 @@ async def run_end(
 # ── lessons learned + task outcome scores ─────────────────────────────
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def lesson_write(
     trigger: str,
     issue: str,
@@ -927,7 +999,7 @@ async def lesson_write(
         return _activity.lesson_out(lesson)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def lesson_search(query: str, top_k: int = 5) -> list[dict]:
     """Search lessons by trigger/keywords/issue. Call this when starting a
     task: lessons whose trigger matches your scenario are returned first."""
@@ -937,7 +1009,7 @@ async def lesson_search(query: str, top_k: int = 5) -> list[dict]:
         return [_activity.lesson_out(lesson) for lesson in lessons]
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def score_write(
     task_id: str,
     dimension: str,
@@ -959,7 +1031,7 @@ async def score_write(
         return _activity.score_out(score)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def score_list(task_id: str = "", dimension: str = "", limit: int = 50) -> list[dict]:
     """List task outcome scores, newest first, optionally filtered."""
     async with _session() as db:
@@ -969,7 +1041,7 @@ async def score_list(task_id: str = "", dimension: str = "", limit: int = 50) ->
         return [_activity.score_out(score) for score in scores]
 
 
-@server.tool()
+@tool()
 @observed
 async def add_note(
     body: str,
@@ -1055,7 +1127,7 @@ async def add_note(
         }
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def list_notes(
     doc_id: str = "",
     task_id: str = "",
@@ -1085,7 +1157,7 @@ async def list_notes(
         return [_activity.note_out(row) for row in rows]
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def task_timeline(task_id: str, limit: int = 200) -> dict:
     """One task's merged timeline: activities *and* hand-off notes.
 
@@ -1101,7 +1173,7 @@ async def task_timeline(task_id: str, limit: int = 200) -> dict:
     return result
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def delete_note(
     note_id: int, author: str, ctx: Context | None = None
 ) -> dict:
@@ -1140,7 +1212,7 @@ async def delete_note(
 # ── activity layer: tasks + append-only activity log ──────────────────
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def task_create(
     title: str,
     goal: str = "",
@@ -1162,7 +1234,7 @@ async def task_create(
         return _activity.task_out(task)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def task_update(
     task_id: str,
     status: str = "",
@@ -1184,7 +1256,7 @@ async def task_update(
         return _activity.task_out(task)
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def task_list(status: str = "", owner_agent: str = "", limit: int = 20) -> list[dict]:
     """List tasks, newest activity first, optionally filtered."""
     async with _session() as db:
@@ -1194,7 +1266,7 @@ async def task_list(status: str = "", owner_agent: str = "", limit: int = 20) ->
         return [_activity.task_out(task) for task in tasks]
 
 
-@server.tool()
+@tool()
 async def activity_write(
     kind: str,
     actor_agent: str,
@@ -1275,7 +1347,7 @@ async def activity_write(
         return out
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def activity_list(
     task_id: str = "",
     doc_id: str = "",
@@ -1326,27 +1398,27 @@ async def _curation_call(doc_id: str, name: str, args: dict | None = None) -> di
     return result
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_pages_overview(doc_id: str, start: int = 0, limit: int = 60) -> dict:
     """Survey pages cheaply: per-page block count, label mix, chars,
     whether the page is a printed TOC page, and figure count."""
     return await _curation_call(doc_id, "get_pages_overview", {"start": start, "limit": limit})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_page_blocks(doc_id: str, pages: list[int]) -> dict:
     """Typed OCR blocks for specific pages. ``label`` is the OCR label
     verbatim; ``bbox`` is not a font-size proxy."""
     return await _curation_call(doc_id, "get_page_blocks", {"pages": pages})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_page_text(doc_id: str, pages: list[int]) -> dict:
     """Plain text of specific pages, cheaper than the block stream."""
     return await _curation_call(doc_id, "get_page_text", {"pages": pages})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_chunks(doc_id: str, node_id: str = "", limit: int = 100, offset: int = 0) -> dict:
     """Slice list: index, node, pages, char count, 80-char preview."""
     # Clamp: limit=-1 would return every slice, and a huge limit would too;
@@ -1358,13 +1430,13 @@ async def get_chunks(doc_id: str, node_id: str = "", limit: int = 100, offset: i
     )
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_quality(doc_id: str = "") -> dict:
     """Quality issues (the same enumeration the quality page shows)."""
     return await _curation_call(doc_id or "", "get_quality", {})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def list_quality_signals(days: int = 7, limit: int = 20) -> dict:
     """Library-wide read-only patrol signals.
 
@@ -1378,7 +1450,7 @@ async def list_quality_signals(days: int = 7, limit: int = 20) -> dict:
     )
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_search_signals(doc_id: str, days: int = 7) -> dict:
     """Zero-hit queries that may be about this document, with current keywords
     and the shared terms. A lead for ``set_keywords``, not a verdict."""
@@ -1387,19 +1459,19 @@ async def get_search_signals(doc_id: str, days: int = 7) -> dict:
     )
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_usage(doc_id: str) -> dict:
     """Usage aggregates: queries that surfaced this document, mark_used rate."""
     return await _curation_call(doc_id, "get_usage", {})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_toc_nodes(doc_id: str) -> dict:
     """Flat TOC node list: id, parent, level, number, title, pages, source."""
     return await _curation_call(doc_id, "get_toc_nodes", {})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_printed_toc_llm(doc_id: str, use_cache: bool = True) -> dict:
     """An LLM reading of the printed TOC, to compare against the stored one.
 
@@ -1411,7 +1483,7 @@ async def get_printed_toc_llm(doc_id: str, use_cache: bool = True) -> dict:
     return await _curation_call(doc_id, "get_printed_toc_llm", {"use_cache": use_cache})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def request_toc_rebuild(
     doc_id: str, reason: str, node_id: str = ""
 ) -> dict:
@@ -1428,14 +1500,14 @@ async def request_toc_rebuild(
     )
 
 
-@server.tool()
+@tool()
 async def propose_ops(doc_id: str, ops: list[dict], rationale: str = "") -> dict:
     """Submit a fix program. Each op is validated; the response says
     accepted / pending_human / dropped, with a reason for every drop."""
     return await _curation_call(doc_id, "propose_ops", {"ops": ops, "rationale": rationale})
 
 
-@server.tool()
+@tool(profile=PROFILE_FULL)
 async def get_proposal(doc_id: str, proposal_id: str) -> dict:
     """Read a proposal's verdict and per-op outcomes."""
     return await _curation_call(doc_id, "get_proposal", {"proposal_id": proposal_id})
@@ -1484,13 +1556,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8790)
     args = parser.parse_args(argv)
 
+    active = build_server(_active_profile())
     if args.transport != "stdio":
         enforce_bind_host(args.host)
-        server.run(
+        active.run(
             "streamable-http", host=args.host, port=args.port
         )
     else:
-        server.run("stdio")
+        active.run("stdio")
     return 0
 
 

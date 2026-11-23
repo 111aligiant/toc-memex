@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     tocmemex_db_path: Path = Path("data/tocmemex.db")
     tocmemex_data_dir: Path = Path("data")
 
+    # MCP tool surface started by ``python -m app.mcp_server``: "default"
+    # (8 retrieval/library tools) or "full" (all tools). Anything else falls
+    # back to "default". The in-process console always sees the full surface.
+    tocmemex_tools: str = "default"
+
     # Bind policy for the unauthenticated web / inspector / MCP HTTP entry
     # points. False = loopback only (see ``app.bindguard``); True is the
     # explicit opt-in for a LAN or reverse-proxied deployment.
