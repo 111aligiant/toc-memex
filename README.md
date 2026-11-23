@@ -56,6 +56,10 @@ toc-memex-web            # optional web UI, prebuilt; no npm needed
 The package installs three commands: `toc-memex` (CLI), `toc-memex-mcp` (MCP
 server) and `toc-memex-web` (API + prebuilt web UI).
 
+If `pip` connects but stalls with no progress (some IPv6 networks), retry with
+a mirror, e.g. `--index-url https://pypi.tuna.tsinghua.edu.cn/simple`. The
+default commands above do not use a mirror.
+
 MCP client config:
 
 ```json

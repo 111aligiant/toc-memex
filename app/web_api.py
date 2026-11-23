@@ -3026,7 +3026,7 @@ def _doc_row(db_path: Path, doc_id: str) -> sqlite3.Row:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m app.web_api")
+    parser = argparse.ArgumentParser(prog="toc-memex-web")
     parser.add_argument("--db", default="data/tocmemex.db")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--host", default="127.0.0.1")
