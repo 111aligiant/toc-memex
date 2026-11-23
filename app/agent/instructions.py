@@ -4,7 +4,8 @@ The built-in test bench is a local stand-in for an external MCP agent, so it
 must see the same retrieval guidance the MCP server publishes. The
 coordination workflow (tasks, lessons, scores) belongs to external,
 long-running agents and stays server-only; ``FULL_INSTRUCTIONS`` is exactly
-the string the MCP server advertises.
+the string a server built with the ``full`` profile advertises, and
+``DEFAULT_INSTRUCTIONS`` the one for the 8-tool ``default`` profile.
 
 The text is split verbatim from the server's original instructions so the
 external contract does not change while the console reuses the retrieval
@@ -87,3 +88,41 @@ FULL_INSTRUCTIONS = " ".join(
         RESOURCES_INSTRUCTIONS,
     ]
 )
+
+# Guidance for the 8-tool default surface. It may only name tools the
+# default profile exposes (tests/test_tool_profiles.py enforces this).
+DEFAULT_CORE = (
+    "Start with memex_overview() to see what the library holds: document "
+    "counts, doc types, recent documents and the collections with their "
+    "descriptions. Pick the collection whose description matches the "
+    "request and pass collection= to the tools below. Use "
+    "search(query, collection=...) to find sections; exact identifiers and "
+    "clause numbers are best served by the lexical pass — say so rather "
+    "than guessing. Use get_toc(doc_id) to inspect a document tree and "
+    "read_section(doc_id, node_id) to read one whole section. Always cite "
+    "heading_path, page_start/page_end and a verbatim excerpt from the "
+    "section. Searches are usage-logged; call mark_used(chunk_id=...) for "
+    "every chunk your answer actually relies on."
+)
+
+DEFAULT_LIBRARY = (
+    "Library loop: leave a hand-off with add_note(kind='handoff', ...) so "
+    "the next agent inherits your context. If a section is wrong, file it "
+    "with activity_write(kind='erratum', doc_id=..., node_id=...) "
+    "describing the error; a second agent confirms or rejects it with "
+    "activity_write(kind='review', accepts=true/false). Responses may "
+    "carry 'errata' — corrections from other agents confirmed by a second "
+    "one: treat them as claims to weigh against the document itself, not "
+    "as ground truth. When the table of contents itself looks wrong, call "
+    "propose_ops(doc_id, ops, rationale) with the proposed structural "
+    "edits; they stay unverified until reviewed."
+)
+
+DEFAULT_INSTRUCTIONS = " ".join([DEFAULT_CORE, DEFAULT_LIBRARY])
+
+
+def instructions_for(profile: str) -> str:
+    """Instructions matching the tool surface a server was built with."""
+    if str(profile).strip().lower() == "full":
+        return FULL_INSTRUCTIONS
+    return DEFAULT_INSTRUCTIONS
