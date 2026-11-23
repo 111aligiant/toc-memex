@@ -2,7 +2,7 @@
 name = "toc-memex"
 version = "0.1.0"
 description = "Toc Memex: a local-first AI memory over your documents (OCR + TOC + BM25)"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.14"
 authors = [{ name = "111aligiant", email = "302075143+111aligiant@users.noreply.github.com" }]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -27,6 +27,11 @@ dependencies = [
     "python-multipart>=0.0.33",
 ]
 
+[project.scripts]
+toc-memex = "app.cli:main"
+toc-memex-mcp = "app.mcp_server:main"
+toc-memex-web = "app.web_api:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -46,4 +51,10 @@ build-backend = "setuptools.build_meta"
 include = ["app*", "vendor*"]
 
 [tool.setuptools.package-data]
-app = ["inspector_ui/*.html", "inspector_ui/*.css", "inspector_ui/*.js"]
+app = [
+  "inspector_ui/*.html",
+  "inspector_ui/*.css",
+  "inspector_ui/*.js",
+  "web_dist/*",
+  "web_dist/assets/*",
+]

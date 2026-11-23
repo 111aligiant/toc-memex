@@ -35,12 +35,41 @@ neutral rules; any domain vocabulary is supplied by you through configuration.
 
 ## Requirements
 
-- Python 3.12
-- Node.js 20+ (only to build the web UI)
+- Python 3.12 (3.13 is experimental but installable: `requires-python = ">=3.12,<3.14"`)
+- Node.js 20+ only when you rebuild the web UI from source; the packaged bundle needs no npm
 - Windows for the DOCX/DOC Word-COM path; other formats work cross-platform
 - Optional: an OCR API token and/or an OpenAI-compatible LLM endpoint
 
-## Quick start
+## Install
+
+```bash
+# Run the MCP server straight away, without installing first
+uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
+
+# Or install CLI + MCP + Web locally
+pipx install git+https://github.com/111aligiant/toc-memex
+toc-memex init
+toc-memex ingest path/to/document.pdf
+toc-memex-web            # optional web UI, prebuilt; no npm needed
+```
+
+The package installs three commands: `toc-memex` (CLI), `toc-memex-mcp` (MCP
+server) and `toc-memex-web` (API + prebuilt web UI).
+
+MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "toc-memex": {
+      "command": "toc-memex-mcp",
+      "env": { "TOCMEMEX_DB_PATH": "C:/path/to/data/tocmemex.db" }
+    }
+  }
+}
+```
+
+## Quick start (development)
 
 ```bash
 python -m venv .venv
@@ -57,7 +86,7 @@ python -m app.cli search "8.3" --top 5
 python -m app.cli search "ACME 100" --top 5
 ```
 
-Build and start the web UI:
+Rebuild the web bundle and start the server from source:
 
 ```bash
 cd web
@@ -84,8 +113,10 @@ python -m app.inspector --db data/tocmemex.db --port 8765
 ## MCP server
 
 ```bash
+toc-memex-mcp
+toc-memex-mcp --transport streamable-http --host 127.0.0.1 --port 8790
+# development checkout:
 python -m app.mcp_server
-python -m app.mcp_server --transport streamable-http --host 127.0.0.1 --port 8790
 ```
 
 Example stdio client configuration:

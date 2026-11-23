@@ -838,6 +838,18 @@ class _HostOriginGuardMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+def default_web_dir() -> Path | None:
+    """Prefer a local dev build, then the dist shipped inside the package."""
+    candidates = (
+        Path("web/dist"),
+        Path(__file__).resolve().parent / "web_dist",
+    )
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
 def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="Toc Memex API", docs_url=None, redoc_url=None)
     app.add_middleware(_HostOriginGuardMiddleware)
@@ -3019,7 +3031,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8791)
-    parser.add_argument("--web-dir", default="web/dist")
+    parser.add_argument(
+        "--web-dir",
+        default=None,
+        help=(
+            "static frontend directory; default: web/dist when present, "
+            "otherwise the web_dist shipped inside the package; pass an "
+            "empty string to serve the API only"
+        ),
+    )
     args = parser.parse_args(argv)
 
     enforce_bind_host(args.host)
@@ -3033,7 +3053,10 @@ def main(argv: list[str] | None = None) -> int:
             "Run `python -m app.cli init` first, or double-click start-web.bat "
             "(it initializes an empty library on first launch)."
         )
-    web_dir = Path(args.web_dir) if args.web_dir else None
+    if args.web_dir is None:
+        web_dir = default_web_dir()
+    else:
+        web_dir = Path(args.web_dir) if args.web_dir else None
     app = create_app(db_path, Path(args.data_dir) if args.data_dir else None, web_dir)
     print(f"Toc Memex web: http://{args.host}:{args.port}")
     print(f"database: {db_path}")
