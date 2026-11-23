@@ -388,6 +388,92 @@ async def search_chunks(
     return hits
 
 
+FILTER_KEYS = {"doc_type", "source", "date_from", "date_to", "doc_ids", "doc_id"}
+
+
+def _filter_string(filters: dict, key: str) -> str:
+    value = filters[key]
+    if not isinstance(value, str):
+        raise ValueError(f"filter {key} 必须是字符串")
+    return value
+
+
+async def doc_ids_for_filters(
+    db: AsyncSession, filters: dict
+) -> list[str] | None:
+    """Resolve document-metadata filters to a document-id list.
+
+    ``None`` means "no filter"; ``[]`` means the filter matched no document,
+    so the caller must return zero hits and never fall back to the whole
+    library. Filters combine with AND: a document must satisfy every key.
+
+    ``doc_id`` / ``doc_ids`` are the same selector — one singular, one
+    plural — so the union of the ids they name is the allowed set.
+    ``date_from`` / ``date_to`` compare ``Document.doc_date`` lexically
+    (stored as ISO strings); a document with no date matches no date bound,
+    because an unknown date is not "inside" any requested range.
+    """
+    if filters is None:
+        return None
+    if not isinstance(filters, dict):
+        raise ValueError("filters 必须是对象（dict）")
+    if not filters:
+        return None
+    unknown = set(filters) - FILTER_KEYS
+    if unknown:
+        raise ValueError(
+            "未知 filter 键: "
+            + "、".join(sorted(unknown))
+            + "；可用: "
+            + "、".join(sorted(FILTER_KEYS))
+        )
+
+    allowed: set[str] | None = None
+
+    def _narrow(ids: list[str]) -> None:
+        nonlocal allowed
+        ids_set = set(ids)
+        allowed = ids_set if allowed is None else allowed & ids_set
+
+    for key in ("doc_type", "source"):
+        if key in filters:
+            value = _filter_string(filters, key)
+            rows = await db.execute(
+                select(Document.id).where(getattr(Document, key) == value)
+            )
+            _narrow(list(rows.scalars().all()))
+
+    wanted: list[str] = []
+    if "doc_id" in filters:
+        wanted.append(_filter_string(filters, "doc_id"))
+    if "doc_ids" in filters:
+        value = filters["doc_ids"]
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError("filter doc_ids 必须是字符串列表")
+        wanted.extend(value)
+    if wanted:
+        rows = await db.execute(
+            select(Document.id).where(
+                Document.id.in_(list(dict.fromkeys(wanted)))
+            )
+        )
+        _narrow(list(rows.scalars().all()))
+
+    for key, op in (("date_from", ">="), ("date_to", "<=")):
+        if key in filters:
+            value = _filter_string(filters, key)
+            column = Document.doc_date
+            condition = column >= value if op == ">=" else column <= value
+            rows = await db.execute(
+                select(Document.id).where(column.is_not(None), condition)
+            )
+            _narrow(list(rows.scalars().all()))
+
+    return None if allowed is None else sorted(allowed)
+
+
 _FRONT_MATTER_RE = re.compile(
     r"参考文献|参考资料|引用文献|索引|目录|前言|封面|版权"
 )
@@ -723,26 +809,208 @@ async def scoped_miss_hint(
     )
 
 
+_SEARCH_MODES = ("auto", "lexical", "semantic", "hybrid")
+_SEMANTIC_MODES = frozenset({"semantic", "hybrid"})
+_MODE_NOTE = "语义通道尚未启用，本次按 lexical 执行；结果仍带页码引用。"
+
+
+def _decorate_pages(hits: list[dict]) -> list[dict]:
+    """Add the agent-facing page fields to every hit, on every channel.
+
+    ``page_start/page_end`` keep their internal 0-based PDF-index meaning.
+    ``pdf_page_*`` are the 1-based pages an agent should cite; the printed
+    labels are not stored yet, so ``printed_page_*`` stay null.
+    """
+    for hit in hits:
+        page_start = hit.get("page_start")
+        page_end = hit.get("page_end")
+        hit["pdf_page_start"] = (
+            page_start + 1 if isinstance(page_start, int) else None
+        )
+        hit["pdf_page_end"] = (
+            page_end + 1 if isinstance(page_end, int) else None
+        )
+        hit["printed_page_start"] = None
+        hit["printed_page_end"] = None
+    return hits
+
+
+def _channels_used(hits: list[dict]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            hit.get("match_type") for hit in hits if hit.get("match_type")
+        )
+    )
+
+
+def _next_steps(hits: list[dict]) -> list[dict]:
+    """Deterministic next calls: up to two section reads plus the TOC."""
+    steps: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for hit in hits:
+        node_id = hit.get("node_id")
+        if not node_id:
+            continue
+        key = (hit["doc_id"], node_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        steps.append(
+            {
+                "tool": "read_section",
+                "args": {"doc_id": hit["doc_id"], "node_id": node_id},
+            }
+        )
+        if len(steps) >= 2:
+            break
+    if hits and len(steps) < 3:
+        steps.append({"tool": "get_toc", "args": {"doc_id": hits[0]["doc_id"]}})
+    return steps[:3]
+
+
+async def _miss_hints(
+    db: AsyncSession,
+    query: str,
+    scope: Scope,
+    filters: dict,
+    results: list[dict],
+) -> list[str]:
+    """Deterministic zero-hit advice; no LLM, no retries."""
+    if results:
+        # A successful search gets no forced advice, so ``hint`` stays null
+        # for callers that rely on the legacy contract.
+        return []
+    hints: list[str] = []
+    if scope.active:
+        hint = await scoped_miss_hint(db, query, scope)
+        if hint:
+            hints.append(hint)
+    if filters:
+        rendered = ", ".join(f"{key}={value!r}" for key, value in filters.items())
+        hints.append(
+            f"filters 把结果过滤空了：{rendered}；去掉 filters 或放宽日期。"
+        )
+    if not scope.active and not filters:
+        if extract_section_numbers(query):
+            hints.append(
+                "章节号没命中；先 get_toc(doc_id) 确认编号，或改用标题关键词。"
+            )
+        else:
+            hints.append("换更短的词、同义词，或用文档里的英文/缩写再试。")
+    return hints
+
+
 async def scoped_search(
     db: AsyncSession,
     query: str,
     top_k: int = 8,
     collection: str = "",
     doc_ids: list[str] | None = None,
+    filters: dict | None = None,
+    mode: str = "auto",
 ) -> dict:
-    """Search, optionally narrowed to a collection, with a routing hint.
+    """Search, optionally narrowed by collection and metadata filters.
 
-    Returns ``{"results", "hint", "scope"}``. ``hint`` is only set when a
-    scoped search found nothing, and says which other collections do have
-    hits. The collection filter goes through ``scope_doc_ids`` — never
-    ``doc_ids`` — so standard-number routing keeps working inside a scope.
+    ``mode`` accepts ``auto|lexical|semantic|hybrid`` (an unknown value is a
+    ``ValueError``; the MCP layer turns it into a ToolError). Only lexical
+    retrieval exists this round, so every mode runs the lexical pass:
+    ``semantic`` / ``hybrid`` report ``degraded=True`` and explain in
+    ``mode_note`` instead of pretending to be semantic.
+
+    Returns ``results`` / ``hint`` / ``scope`` (backward compatible) plus
+    ``hints`` / ``next`` / ``empty_reason`` / ``mode_*`` / ``filters`` /
+    ``channels_used``. ``hint`` is ``hints[0]`` when there is one. Every
+    hit carries ``pdf_page_*`` (1-based PDF pages) alongside the unchanged
+    0-based internal ``page_start/page_end``; ``printed_page_*`` are null.
+
+    Metadata ``filters`` resolve to a document set (``doc_ids_for_filters``)
+    and are intersected with any explicit ``doc_ids``. Supplying either one
+    means the caller already fixed the scope, so identifier routing is
+    disabled (``search_chunks`` sees ``doc_ids`` not None). A collection
+    alone keeps routing working through ``scope_doc_ids``.
     """
+    requested = str(mode or "auto").strip().lower()
+    if requested not in _SEARCH_MODES:
+        raise ValueError("mode 必须是 auto|lexical|semantic|hybrid")
+    degraded = requested in _SEMANTIC_MODES
+    mode_note = _MODE_NOTE if degraded else None
+
+    if filters is not None and not isinstance(filters, dict):
+        raise ValueError("filters 必须是对象（dict）")
+    filters = filters or {}
+    echo_filters = dict(filters)
+
     scope = await resolve_scope(db, collection)
     scope_ids = await doc_ids_in_scope(db, scope)
-    results = await search_chunks(
-        db, query, top_k=top_k, doc_ids=doc_ids, scope_doc_ids=scope_ids
-    )
-    hint = None
-    if not results and scope.active:
-        hint = await scoped_miss_hint(db, query, scope)
-    return {"results": results, "hint": hint, "scope": _scope_out(scope)}
+    filter_ids = await doc_ids_for_filters(db, filters)
+
+    def _envelope(
+        results: list[dict], empty_reason: str | None, hints: list[str]
+    ) -> dict:
+        results = _decorate_pages(results)
+        return {
+            "results": results,
+            "hint": hints[0] if hints else None,
+            "hints": hints,
+            "next": _next_steps(results),
+            "empty_reason": empty_reason,
+            "mode_requested": requested,
+            "mode_effective": "lexical",
+            "degraded": degraded,
+            "mode_note": mode_note,
+            "filters": echo_filters,
+            "channels_used": _channels_used(results),
+            "scope": _scope_out(scope),
+        }
+
+    async def _empty(reason: str) -> dict:
+        hints = await _miss_hints(db, query, scope, filters, [])
+        return _envelope([], reason, hints)
+
+    # An empty collection is a real dead end: return nothing, never the
+    # whole library.
+    if scope.active and not scope_ids:
+        return await _empty("collection_empty")
+    # A filter that matched no document is likewise a dead end.
+    if filter_ids == []:
+        return await _empty("filtered_out")
+
+    has_explicit = doc_ids is not None or filter_ids is not None
+    combined: list[str] | None = None
+    if doc_ids is not None:
+        combined = list(dict.fromkeys(doc_ids))
+    if filter_ids is not None:
+        allowed = set(filter_ids)
+        combined = (
+            filter_ids
+            if combined is None
+            else [doc_id for doc_id in combined if doc_id in allowed]
+        )
+    if has_explicit and scope_ids is not None:
+        allowed = set(scope_ids)
+        combined = [doc_id for doc_id in (combined or []) if doc_id in allowed]
+    # Empty intersection: the caller's own scope excluded everything, so
+    # short-circuit here rather than passing [] (which flips identifier
+    # routing off and could silently widen a section query).
+    if has_explicit and not combined:
+        return await _empty("filtered_out")
+
+    if has_explicit:
+        results = await search_chunks(
+            db, query, top_k=top_k, doc_ids=combined, scope_doc_ids=None
+        )
+    else:
+        results = await search_chunks(
+            db, query, top_k=top_k, doc_ids=None, scope_doc_ids=scope_ids
+        )
+
+    empty_reason: str | None = None
+    if not results:
+        if not seg_query(normalize_encoding_artifacts(query or "")):
+            empty_reason = "no_terms"
+        elif scope.active:
+            empty_reason = "scoped_miss"
+        else:
+            empty_reason = "no_match"
+    hints = await _miss_hints(db, query, scope, filters, results)
+    return _envelope(results, empty_reason, hints)
