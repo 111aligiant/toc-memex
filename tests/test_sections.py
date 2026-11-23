@@ -448,6 +448,13 @@ async def test_read_section_falls_back_to_page_range(tmp_path):
     assert result["page_start"] == 66
     assert result["chunk_ids"] == [chunk_id]
     assert "失效判据" in result["content"]
+    assert result["fallback"] == "page_range"
+    assert result["citation_confidence"] == "low"
+    assert result["citation_note"]
+    assert result["pdf_page_start"] == 67
+    assert result["pdf_page_end"] == 67
+    assert result["printed_page_start"] is None
+    assert result["printed_page_end"] is None
 
     await engine.dispose()
 
@@ -517,6 +524,342 @@ async def _seed_custom(tmp_path, nodes, chunks):
         await db.commit()
 
     return engine
+
+
+async def test_read_section_page_range_keeps_preceding_sibling(tmp_path):
+    """A real preceding sibling's same-page chunk still feeds the section."""
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9.2",
+                "level": 1,
+                "heading_num": "9.2",
+                "title": "9.2 试验实施",
+                "heading_path": "第9章 爆炸大气 > 9.2 试验实施",
+                "page_start": 65,
+                "page_end": 65,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+            {
+                "node_id": "d1:9.3",
+                "level": 1,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[
+            {
+                "node_id": "d1:9.2",
+                "chunk_index": 0,
+                "content": "9.3 失效判据 试验样品不应出现火花。",
+                "heading_path": "第9章 爆炸大气 > 9.2 试验实施",
+                "page_start": 66,
+                "page_end": 66,
+            },
+        ],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    assert result["fallback"] == "page_range"
+    assert result["citation_confidence"] == "low"
+    assert len(result["chunk_ids"]) == 1
+    assert "失效判据" in result["content"]
+
+    await engine.dispose()
+
+
+async def test_read_section_page_range_excludes_following_sibling(tmp_path):
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9.3",
+                "level": 1,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+            {
+                "node_id": "d1:9.4",
+                "level": 1,
+                "heading_num": "9.4",
+                "title": "9.4 后续要求",
+                "heading_path": "第9章 爆炸大气 > 9.4 后续要求",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[
+            {
+                "node_id": None,
+                "chunk_index": 0,
+                "content": "本节前文：试验样品不应出现火花。",
+                "heading_path": "第9章 爆炸大气",
+                "page_start": 66,
+                "page_end": 66,
+            },
+            {
+                "node_id": "d1:9.4",
+                "chunk_index": 1,
+                "content": "后续章节：这是下一节的正文，不属于本节。",
+                "heading_path": "第9章 爆炸大气 > 9.4 后续要求",
+                "page_start": 66,
+                "page_end": 66,
+            },
+        ],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    assert result["fallback"] == "page_range"
+    assert result["citation_confidence"] == "low"
+    assert "本节前文" in result["content"]
+    assert "后续章节" not in result["content"]
+    assert len(result["chunk_ids"]) == 1
+
+    await engine.dispose()
+
+
+async def test_read_section_page_range_excludes_next_chapter(tmp_path):
+    """A different-branch chapter overlapping the page range is excluded."""
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9",
+                "level": 1,
+                "heading_num": "第9章",
+                "title": "第9章 爆炸大气",
+                "heading_path": "第9章 爆炸大气",
+                "page_start": 60,
+                "page_end": 70,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+            {
+                "node_id": "d1:9.3",
+                "parent_id": "d1:9",
+                "level": 2,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+            {
+                "node_id": "d1:10",
+                "level": 1,
+                "heading_num": "第10章",
+                "title": "第10章 其他",
+                "heading_path": "第10章 其他",
+                "page_start": 65,
+                "page_end": 70,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[
+            {
+                "node_id": None,
+                "chunk_index": 0,
+                "content": "本节前文：试验样品不应出现火花。",
+                "heading_path": "第9章 爆炸大气",
+                "page_start": 66,
+                "page_end": 66,
+            },
+            {
+                "node_id": "d1:10",
+                "chunk_index": 1,
+                "content": "邻章正文：其他章节的内容，不属于本节。",
+                "heading_path": "第10章 其他",
+                "page_start": 66,
+                "page_end": 66,
+            },
+        ],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    assert result["fallback"] == "page_range"
+    assert result["citation_confidence"] == "low"
+    assert "本节前文" in result["content"]
+    assert "邻章正文" not in result["content"]
+    assert len(result["chunk_ids"]) == 1
+
+    await engine.dispose()
+
+
+async def test_read_section_chunk_range_is_high_confidence(tmp_path):
+    engine, _ = await _seed(tmp_path)
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:8.3")
+
+    assert result["fallback"] == "chunk_range"
+    assert result["citation_confidence"] == "high"
+    assert result["citation_note"] is None
+    assert result["pdf_page_start"] == 13
+    assert result["pdf_page_end"] == 14
+
+    await engine.dispose()
+
+
+async def test_read_section_citation_pages_do_not_widen(tmp_path):
+    """A fallback chunk that spills onto the next page must not widen the
+    section's cited page range."""
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9.3",
+                "level": 1,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[
+            {
+                "node_id": None,
+                "chunk_index": 0,
+                "content": "失效判据：试验样品不应出现火花，下一行延续到下一页。",
+                "heading_path": "第9章 爆炸大气",
+                "page_start": 66,
+                "page_end": 67,
+            },
+        ],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    assert result["page_start"] == 66
+    assert result["page_end"] == 66
+    assert result["pdf_page_start"] == 67
+    assert result["pdf_page_end"] == 67
+    assert result["chunks"][0]["page_end"] == 67
+
+    await engine.dispose()
+
+
+async def test_read_section_returns_chunk_node_ids(tmp_path):
+    """The per-chunk node ids feeding 05 must not include later sections."""
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9.3",
+                "level": 1,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+            {
+                "node_id": "d1:9.4",
+                "level": 1,
+                "heading_num": "9.4",
+                "title": "9.4 后续要求",
+                "heading_path": "第9章 爆炸大气 > 9.4 后续要求",
+                "page_start": 66,
+                "page_end": 66,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[
+            {
+                "node_id": None,
+                "chunk_index": 0,
+                "content": "本节前文：试验样品不应出现火花。",
+                "heading_path": "第9章 爆炸大气",
+                "page_start": 66,
+                "page_end": 66,
+            },
+            {
+                "node_id": "d1:9.4",
+                "chunk_index": 1,
+                "content": "后续章节：这是下一节的正文。",
+                "heading_path": "第9章 爆炸大气 > 9.4 后续要求",
+                "page_start": 66,
+                "page_end": 66,
+            },
+        ],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    node_ids = {chunk["node_id"] for chunk in result["chunks"]}
+    assert "d1:9.4" not in node_ids
+    assert node_ids == {None}
+
+    await engine.dispose()
+
+
+async def test_read_section_pdf_pages_are_1based(tmp_path):
+    engine = await _seed_custom(
+        tmp_path,
+        nodes=[
+            {
+                "node_id": "d1:9.3",
+                "level": 1,
+                "heading_num": "9.3",
+                "title": "9.3 失效判据",
+                "heading_path": "第9章 爆炸大气 > 9.3 失效判据",
+                "page_start": None,
+                "page_end": None,
+                "chunk_start": None,
+                "chunk_end": None,
+            },
+        ],
+        chunks=[],
+    )
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        result = await read_section(db, "d1", node_id="d1:9.3")
+
+    assert result["page_start"] is None
+    assert result["page_end"] is None
+    assert result["pdf_page_start"] is None
+    assert result["pdf_page_end"] is None
+    assert result["fallback"] is None
+    assert result["citation_confidence"] is None
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

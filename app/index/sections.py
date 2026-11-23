@@ -183,17 +183,87 @@ async def find_sections_by_number(
     return matches
 
 
-async def chunks_for_node(
-    db: AsyncSession, doc_id: str, node: TocNode
+def _node_order_key(node: TocNode) -> tuple[int, int]:
+    """Reading order: page first, then the autoincrement id (same-page tie)."""
+    page = node.page_start if node.page_start is not None else 10**9
+    return (page, node.id)
+
+
+def _filter_page_range(
+    node: TocNode,
+    chunks: list[Chunk],
+    all_nodes: list[TocNode],
+    subtree_ids: set[str],
 ) -> list[Chunk]:
-    """Return chunks belonging to a section, including its subtree.
+    """Keep only chunks that can plausibly belong to ``node``.
 
-    Three fallbacks, in order: the node's aggregated chunk range, its
-    descendants' chunks, then the page range. The last one covers TOC nodes
-    whose text was assigned to a neighbouring section during chunking.
+    Page-range fallback is a heuristic: when a heading sits on the first
+    line of a page, its text was often assigned to the previous section.
+    Allow unassigned chunks, the target subtree, ancestors, preceding
+    siblings, and unknown nodes that start no later than the target page.
+    Reject following siblings, neighbouring chapters, and unknown nodes
+    that start after this section.
     """
-    chunks: list[Chunk] = []
+    by_node_id = {item.node_id: item for item in all_nodes}
+    target_order = _node_order_key(node)
 
+    ancestors: set[str] = set()
+    parent_id = node.parent_id
+    seen: set[str] = set()
+    while parent_id and parent_id not in seen:
+        seen.add(parent_id)
+        ancestors.add(parent_id)
+        parent = by_node_id.get(parent_id)
+        parent_id = parent.parent_id if parent is not None else None
+
+    preceding_ids = {
+        item.node_id
+        for item in all_nodes
+        if item.parent_id == node.parent_id
+        and item.node_id != node.node_id
+        and _node_order_key(item) < target_order
+    }
+
+    allowed: list[Chunk] = []
+    for chunk in chunks:
+        chunk_node_id = chunk.node_id
+        if chunk_node_id is None:
+            allowed.append(chunk)
+            continue
+        if (
+            chunk_node_id in subtree_ids
+            or chunk_node_id in ancestors
+            or chunk_node_id in preceding_ids
+        ):
+            allowed.append(chunk)
+            continue
+        if chunk_node_id in by_node_id:
+            # A known node we did not accept above: following sibling or
+            # neighbouring chapter. Never treat its body as this section's.
+            continue
+        # Unknown node (no TOC entry). The common cause is a heading at the
+        # page top whose text was cut to the previous section, so it starts
+        # no later than this section. Starting after it is more likely the
+        # next content.
+        if (
+            node.page_start is not None
+            and chunk.page_start is not None
+            and chunk.page_start <= node.page_start
+        ):
+            allowed.append(chunk)
+    return allowed
+
+
+async def chunks_for_node_with_fallback(
+    db: AsyncSession, doc_id: str, node: TocNode
+) -> tuple[list[Chunk], str | None]:
+    """Return ``(chunks, fallback)`` for a section.
+
+    ``fallback`` is ``"chunk_range"``, ``"subtree"``, ``"page_range"`` or
+    ``None``. The page range covers TOC nodes whose text was assigned to a
+    neighbouring section during chunking; see ``_filter_page_range`` for
+    which chunks that fallback accepts.
+    """
     if node.chunk_start is not None and node.chunk_end is not None:
         stmt = (
             select(Chunk)
@@ -205,53 +275,64 @@ async def chunks_for_node(
             .order_by(Chunk.chunk_index)
         )
         chunks = list((await db.execute(stmt)).scalars().all())
+        if chunks:
+            return chunks, "chunk_range"
 
-    if not chunks:
-        all_nodes = (
-            (await db.execute(select(TocNode).where(TocNode.doc_id == doc_id)))
-            .scalars()
-            .all()
+    all_nodes = (
+        (await db.execute(select(TocNode).where(TocNode.doc_id == doc_id)))
+        .scalars()
+        .all()
+    )
+    children: dict[str, list[str]] = {}
+    for item in all_nodes:
+        if item.parent_id:
+            children.setdefault(item.parent_id, []).append(item.node_id)
+
+    subtree_ids: set[str] = set()
+    stack = [node.node_id]
+    while stack:
+        current = stack.pop()
+        if current in subtree_ids:
+            continue
+        subtree_ids.add(current)
+        stack.extend(children.get(current, []))
+
+    stmt = (
+        select(Chunk)
+        .where(Chunk.doc_id == doc_id, Chunk.node_id.in_(subtree_ids))
+        .order_by(Chunk.chunk_index)
+    )
+    chunks = list((await db.execute(stmt)).scalars().all())
+    if chunks:
+        return chunks, "subtree"
+
+    if node.page_start is None or node.page_end is None:
+        return [], None
+
+    stmt = (
+        select(Chunk)
+        .where(
+            Chunk.doc_id == doc_id,
+            Chunk.page_start.is_not(None),
+            Chunk.page_end.is_not(None),
+            Chunk.page_start <= node.page_end,
+            Chunk.page_end >= node.page_start,
         )
-        children: dict[str, list[str]] = {}
-        for item in all_nodes:
-            if item.parent_id:
-                children.setdefault(item.parent_id, []).append(item.node_id)
+        .order_by(Chunk.chunk_index)
+    )
+    candidates = list((await db.execute(stmt)).scalars().all())
+    return _filter_page_range(node, candidates, all_nodes, subtree_ids), "page_range"
 
-        node_ids: set[str] = set()
-        stack = [node.node_id]
-        while stack:
-            current = stack.pop()
-            if current in node_ids:
-                continue
-            node_ids.add(current)
-            stack.extend(children.get(current, []))
 
-        if node_ids:
-            stmt = (
-                select(Chunk)
-                .where(Chunk.doc_id == doc_id, Chunk.node_id.in_(node_ids))
-                .order_by(Chunk.chunk_index)
-            )
-            chunks = list((await db.execute(stmt)).scalars().all())
+async def chunks_for_node(
+    db: AsyncSession, doc_id: str, node: TocNode
+) -> list[Chunk]:
+    """Return chunks belonging to a section, including its subtree.
 
-    if (
-        not chunks
-        and node.page_start is not None
-        and node.page_end is not None
-    ):
-        stmt = (
-            select(Chunk)
-            .where(
-                Chunk.doc_id == doc_id,
-                Chunk.page_start.is_not(None),
-                Chunk.page_end.is_not(None),
-                Chunk.page_start <= node.page_end,
-                Chunk.page_end >= node.page_start,
-            )
-            .order_by(Chunk.chunk_index)
-        )
-        chunks = list((await db.execute(stmt)).scalars().all())
-
+    Thin wrapper over :func:`chunks_for_node_with_fallback` that drops the
+    fallback label.
+    """
+    chunks, _ = await chunks_for_node_with_fallback(db, doc_id, node)
     return chunks
 
 
@@ -551,6 +632,8 @@ async def read_section(
     """
     node: TocNode | None = None
     resolved_from: str | None = None
+    fallback: str | None = None
+    page_mode = False
 
     if node_id:
         from ..curation.identity import resolve_node_id
@@ -573,7 +656,7 @@ async def read_section(
                     "可用 get_toc 查看现有节点）"
                 )
             resolved_from = requested
-        chunks = await chunks_for_node(db, doc_id, node)
+        chunks, fallback = await chunks_for_node_with_fallback(db, doc_id, node)
         heading_num = node.heading_num
         title = node.title
         heading_path = node.heading_path
@@ -593,8 +676,29 @@ async def read_section(
         heading_num = None
         title = f"pages {page_start}-{page_end}"
         heading_path = title
+        fallback = "page_range"
+        page_mode = True
     else:
         raise ValueError("node_id or page_start/page_end is required")
+
+    if page_mode:
+        citation_confidence: str | None = "page"
+        citation_note: str | None = None
+    elif fallback == "page_range":
+        citation_confidence = "low"
+        if chunks:
+            citation_note = (
+                "该节没有归属切片，已按页码兜底读取；只包含前文或同页切片，"
+                "可能不完整，引用前请核对原文页码。"
+            )
+        else:
+            citation_note = "该节没有可归属切片，页码兜底也未找到前文内容。"
+    elif fallback in {"chunk_range", "subtree"}:
+        citation_confidence = "high"
+        citation_note = None
+    else:
+        citation_confidence = None
+        citation_note = None
 
     # Keep each chunk's offset in the concatenated text so a truncated read
     # can still say which chunk each visible slice came from. The separator
@@ -675,6 +779,18 @@ async def read_section(
         "level": node.level if node is not None else None,
         "page_start": page_start_value,
         "page_end": page_end_value,
+        # R18: agent-facing page numbers are 1-based PDF pages; internal
+        # page_start/page_end stay 0-based. Printed-page labels are not
+        # stored yet, so they are always null this round.
+        "pdf_page_start": (
+            None if page_start_value is None else page_start_value + 1
+        ),
+        "pdf_page_end": None if page_end_value is None else page_end_value + 1,
+        "printed_page_start": None,
+        "printed_page_end": None,
+        "fallback": fallback,
+        "citation_confidence": citation_confidence,
+        "citation_note": citation_note,
         "chunk_ids": [chunk.id for chunk in chunks],
         "chunks": chunk_segments,
         "char_count": len(full_text),

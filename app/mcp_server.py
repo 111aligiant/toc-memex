@@ -467,6 +467,12 @@ async def read_section(
     node_id from search/get_toc rather than building it from a section
     number; a guessed number is resolved to its parent section when no
     node exists (the response then carries ``resolved_from``).
+    When ``citation_confidence`` is "low" (page-range fallback) the content
+    may be incomplete: check it against the original page range before
+    citing, and reread a neighbouring node if needed. Cite
+    ``pdf_page_start`` / ``pdf_page_end`` (1-based PDF pages);
+    ``printed_page_start`` / ``printed_page_end`` are null when no printed
+    page label is stored.
     """
     if not (doc_id or "").strip() or not (node_id or "").strip():
         raise ToolError("doc_id 和 node_id 都不能为空")
