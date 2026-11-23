@@ -24,6 +24,7 @@ from .sections import (
     extract_section_numbers,
     is_pure_section_query,
     section_hits,
+    title_echo,
     title_hits,
 )
 
@@ -601,6 +602,16 @@ async def _search_chunks(
         body_hits = [hit for hit in merged if not _is_front_matter(hit)]
         front_hits = [hit for hit in merged if _is_front_matter(hit)]
         merged = body_hits + front_hits
+
+    # A query that repeats a section title names that section outright.
+    # "4.2 薄膜介电性能…" is the section of the document that owns that
+    # title, not the other document's unrelated "4.2"; an English heading
+    # quoted inside a Chinese question points at that English section.
+    # Promotion is stable, so channel order is otherwise preserved.
+    echoed = [hit for hit in merged if title_echo(query, hit.get("title"))]
+    if echoed:
+        echoed_ids = {id(hit) for hit in echoed}
+        merged = echoed + [hit for hit in merged if id(hit) not in echoed_ids]
 
     if not merged and identifier_routed and routed_doc_ids:
         return await _doc_fallback_hits(db, routed_doc_ids, top_k)

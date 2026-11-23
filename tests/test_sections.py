@@ -9,6 +9,7 @@ from app.index.sections import (
     is_pure_section_query,
     normalize_section_number,
     read_section,
+    title_echo,
 )
 from app.models import Chunk, Document, Namespace, TocNode
 
@@ -117,6 +118,15 @@ def test_normalize_section_number():
     assert normalize_section_number("第 8 章") == "第8章"
     assert normalize_section_number("附录 A") == "附录A"
     assert normalize_section_number("8.3 振动试验要求") == "8.3"
+
+
+def test_title_echo_ignores_numbers_and_short_titles():
+    assert title_echo("4.2 薄膜介电性能与压电响应的研究", "4.2 薄膜介电性能与压电响应的研究")
+    assert title_echo("Thermodynamic considerations 给出了哪些结论？", "Thermodynamic considerations")
+    # Short stand-bys are too common to name a section.
+    assert not title_echo("这篇论文的实验说明了什么？", "4.2 实验")
+    assert not title_echo("某一章讲了什么", "2.1 摘要")
+    assert not title_echo("完全无关的问题", "4.2 薄膜介电性能与压电响应的研究")
 
 
 def test_pure_section_query():
@@ -274,6 +284,163 @@ async def test_section_query_with_title_keeps_exact_hit_first(tmp_path):
     assert hits
     assert hits[0]["match_type"] == "section"
     assert hits[0]["node_id"] == "d1:8.3"
+
+    await engine.dispose()
+
+
+async def _seed_number_collision(tmp_path):
+    """Two documents share section number ``4.2`` with different titles."""
+    engine = make_engine(tmp_path / "collision.db")
+    await init_db(engine)
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        specs = [
+            ("a", "论文甲", "a:4.2", "4.2 实验", "实验方法见下文，实验重复三次。"),
+            ("b", "论文乙", "b:4.2", "4.2 薄膜介电性能与压电响应的研究",
+             "本节研究薄膜的介电性能与压电响应，给出测试结果。"),
+        ]
+        for doc_id, doc_title, node_id, heading, body in specs:
+            doc = Document(
+                id=doc_id,
+                namespace_id="shared",
+                title=doc_title,
+                filename=f"{doc_id}.pdf",
+                file_path=f"{doc_id}.pdf",
+                content_hash=doc_id,
+                status="ready",
+            )
+            db.add(doc)
+            await db.flush()
+            db.add(
+                TocNode(
+                    doc_id=doc_id,
+                    node_id=node_id,
+                    parent_id=None,
+                    level=1,
+                    heading_num="4.2",
+                    title=heading,
+                    heading_path=heading,
+                    page_start=45 if doc_id == "a" else 63,
+                    page_end=45 if doc_id == "a" else 63,
+                    chunk_start=0,
+                    chunk_end=0,
+                    source="toc_page",
+                    confidence=0.9,
+                )
+            )
+            chunk = Chunk(
+                doc_id=doc_id,
+                node_id=node_id,
+                chunk_index=0,
+                content=body,
+                heading_path=heading,
+                page_start=45 if doc_id == "a" else 63,
+                page_end=45 if doc_id == "a" else 63,
+                token_count=10,
+            )
+            db.add(chunk)
+            await db.flush()
+            await index_document(db, doc, [chunk])
+        await db.commit()
+
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_section_number_collision_follows_the_title_in_the_query(tmp_path):
+    """A query that spells out the title picks the document that owns it.
+
+    ``4.2`` exists in both documents and the earlier pages belong to the
+    other one; without disambiguation the wrong document ranks first.
+    """
+    engine = await _seed_number_collision(tmp_path)
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        hits = await search_chunks(db, "4.2 薄膜介电性能与压电响应的研究", top_k=5)
+        assert hits[0]["doc_id"] == "b"
+        assert hits[0]["node_id"] == "b:4.2"
+
+        plain = await search_chunks(db, "4.2", top_k=5)
+        assert {hit["doc_id"] for hit in plain} == {"a", "b"}
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_quoted_heading_outranks_foreign_language_body_match(tmp_path):
+    """A heading quoted in the query beats a body that repeats one word.
+
+    The Chinese notes repeat ``热力学``, so BM25 prefers them; the English
+    section title appears verbatim in the query and must win.
+    """
+    engine = make_engine(tmp_path / "mixed.db")
+    await init_db(engine)
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        specs = [
+            ("en", "JECS paper", "en:h", "Thermodynamic considerations",
+             "Thermodynamic considerations The free energy is negative."),
+            ("cn", "笔记", "cn:h", "二、相图热力学",
+             "相图热力学 热力学 结论 热力学 结论 热力学 结论 热力学 结论"),
+        ]
+        for doc_id, doc_title, node_id, heading, body in specs:
+            doc = Document(
+                id=doc_id,
+                namespace_id="shared",
+                title=doc_title,
+                filename=f"{doc_id}.pdf",
+                file_path=f"{doc_id}.pdf",
+                content_hash=doc_id,
+                status="ready",
+            )
+            db.add(doc)
+            await db.flush()
+            db.add(
+                TocNode(
+                    doc_id=doc_id,
+                    node_id=node_id,
+                    parent_id=None,
+                    level=1,
+                    heading_num=None,
+                    title=heading,
+                    heading_path=heading,
+                    page_start=1,
+                    page_end=1,
+                    chunk_start=0,
+                    chunk_end=0,
+                    source="toc_page",
+                    confidence=0.9,
+                )
+            )
+            chunk = Chunk(
+                doc_id=doc_id,
+                node_id=node_id,
+                chunk_index=0,
+                content=body,
+                heading_path=heading,
+                page_start=1,
+                page_end=1,
+                token_count=12,
+            )
+            db.add(chunk)
+            await db.flush()
+            await index_document(db, doc, [chunk])
+        await db.commit()
+
+    async with Session() as db:
+        hits = await search_chunks(
+            db, "Thermodynamic considerations 给出了哪些热力学结论？", top_k=5
+        )
+
+    assert hits[0]["doc_id"] == "en"
+    assert hits[0]["node_id"] == "en:h"
 
     await engine.dispose()
 

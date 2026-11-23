@@ -46,6 +46,21 @@ def _title_body(value: str) -> str:
     return _TITLE_PREFIX_RE.sub("", (value or "").strip()).strip()
 
 
+def title_echo(query: str, title: str | None, min_chars: int = 4) -> bool:
+    """True when the query repeats a section's title verbatim.
+
+    A query that spells out a heading — "4.2 薄膜介电性能与压电响应的研究",
+    or an English heading followed by a Chinese question — names that
+    section itself. This is a language-neutral signal: it says nothing about
+    which document or language the rest of the query uses. Short titles
+    ("实验", "目录") are ignored; they are too common to tell sections apart.
+    """
+    body = _normalize_text(_title_body(title or "")).lower()
+    if len(body) < min_chars:
+        return False
+    return body in _normalize_text(query).lower()
+
+
 def normalize_section_number(value: str | None) -> str | None:
     """Normalize ``§8.3`` / ``第 8 章`` / ``8.3条`` to a comparable key."""
     if not value:
