@@ -223,6 +223,13 @@ def _split_segment(
         pos += len(text)
     full = "".join(full_parts)
 
+    # A whitespace cut is a soft floor: if the paragraph break sits very close
+    # to the window start, honouring it would emit a tiny fragment that
+    # overlaps the previous chunk almost entirely (BM25 then scores the same
+    # text twice). Only fall back to whitespace when it leaves a reasonably
+    # sized piece behind.
+    min_piece = max(1, max_chars // 4)
+
     start = 0
     while start < len(full):
         end = min(len(full), start + max_chars)
@@ -230,7 +237,7 @@ def _split_segment(
             cut = full.rfind("\n", start, end)
             if cut <= start:
                 cut = full.rfind(" ", start, end)
-            if cut > start:
+            if cut > start and cut - start >= min_piece:
                 end = cut
         content = full[start:end].strip()
         if content:
@@ -248,7 +255,11 @@ def _split_segment(
             chunk_index += 1
         if end >= len(full):
             break
-        start = max(start + 1, end - overlap)
+        # Never let the overlap swallow more than half of the chunk just
+        # emitted; otherwise the next window can begin at (or before) the
+        # previous start and loop without advancing.
+        step_overlap = min(overlap, (end - start) // 2)
+        start = max(start + 1, end - step_overlap)
     return chunk_index
 
 
