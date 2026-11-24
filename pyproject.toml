@@ -1,6 +1,6 @@
 [project]
 name = "toc-memex"
-version = "0.1.0"
+version = "0.2.0"
 description = "Toc Memex: a local-first AI memory over your documents (OCR + TOC + BM25)"
 requires-python = ">=3.12,<3.14"
 authors = [{ name = "111aligiant", email = "302075143+111aligiant@users.noreply.github.com" }]
