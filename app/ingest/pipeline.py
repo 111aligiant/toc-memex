@@ -518,16 +518,12 @@ async def _parse(
         _record_parse(provenance, parsed, "markdown")
         return parsed
     if suffix in TABLE_SUFFIXES:
-        if suffix == ".xls":
-            # openpyxl reads the OOXML workbook only; the old binary format
-            # fails with an opaque zip error. Say what to do instead.
-            raise ValueError(
-                ".xls (old binary Excel) is not supported; "
-                "save it as .xlsx or .csv and ingest that"
-            )
-        parsed = parse_csv(path) if suffix in {".csv", ".tsv"} else parse_xlsx(path)
-        _record_parse(provenance, parsed, "table")
-        return parsed
+        # shortcut: 表格类入库在 Web 与 CLI 均已禁用（2026-11-24 产品决策，
+        # 等待无目录文档适配方案再放开）。解析函数保留供 reindex/export 使用。
+        raise ValueError(
+            f"{suffix} (spreadsheet) is not supported for ingest yet; "
+            "convert to PDF/Word/Markdown and ingest that"
+        )
     if suffix in IMAGE_SUFFIXES:
         # No text layer exists for a standalone image, so this always OCRs.
         pdf_path = image_to_pdf(

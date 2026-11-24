@@ -24,6 +24,10 @@ web/shots/
 # 本地内部资料/评测语料，不发布
 .superpowers/
 tests/golden/
+benchmarks/
+scripts/run_eval.py
+scripts/eval_retrieval.py
+tests/test_run_eval.py
 
 # 本地设计/spike/定位文档，公开仓库不含 docs/
 docs/
