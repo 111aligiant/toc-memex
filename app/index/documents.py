@@ -31,6 +31,7 @@ def _doc_dict(
         "summary": doc.summary,
         "keywords": doc.keywords,
         "collection": collection,
+        "parse_plan": doc.parse_plan,
         "created_at": doc.created_at,
         "updated_at": doc.updated_at,
     }
@@ -58,8 +59,16 @@ def _node_dict(node: TocNode) -> dict[str, Any]:
 
 
 def _node_sort_key(node: TocNode) -> tuple:
+    """Reading order: page first, then chunk span, then level, then id.
+
+    ``page_start`` is the PDF page a section begins on; ``chunk_start`` is
+    the chunk order the ingester cut, which is more stable than page labels
+    for sections whose printed page is ambiguous. Sections with no known
+    page sort last, so a ``root`` fallback node never precedes real body.
+    """
     return (
         node.page_start if node.page_start is not None else 10**9,
+        node.chunk_start if node.chunk_start is not None else 10**9,
         node.level,
         node.node_id,
     )

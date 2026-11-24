@@ -1353,7 +1353,7 @@ async def ingest_path(
     """Ingest one file. ``force`` re-parses an already-ingested file in
     place; ``force_ocr`` additionally skips direct text extraction."""
     settings = settings or get_settings()
-    path = Path(path)
+    path = Path(path).resolve()
     suffix = path.suffix.lower()
     image_mode = normalize_image_mode(image_mode) if suffix in IMAGE_SUFFIXES else "structured"
     engine = get_engine()

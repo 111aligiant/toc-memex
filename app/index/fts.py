@@ -19,6 +19,7 @@ from .collections import (
     doc_ids_in_scope,
     resolve_scope,
 )
+from .seg import is_cjk as _is_cjk  # single-CJK-ideograph predicate
 from .sections import (
     doc_ids_from_query,
     extract_section_numbers,
@@ -79,21 +80,20 @@ IDENT_RE = re.compile(
 
 
 def seg_index(value: str) -> str:
-    """Index-time segmentation: search mode adds subwords for recall."""
+    """Index-time segmentation: jieba search-mode subwords.
+
+    ``jieba.lcut_for_search`` emits a word and its useful subwords, which
+    FTS5 stores as separate tokens. CJK character n-grams are out of the
+    active matching path (they make meaningless queries match random prose);
+    the ``app.index.seg`` module supplies them as an explicit capability the
+    Context Hub engine inherits, but the lexical layer here stays word-based.
+    """
     return " ".join(jieba.lcut_for_search(value or ""))
 
 
 def count_tokens(value: str) -> int:
-    """Token count using the same jieba dictionary as indexing."""
+    """Token count using the same segmentation as indexing."""
     return len(jieba.lcut(value or ""))
-
-
-def _is_cjk(ch: str) -> bool:
-    """True for a single CJK ideograph (Han block)."""
-    return (
-        len(ch) == 1
-        and "\u4e00" <= ch <= "\u9fff"
-    )
 
 
 def seg_query(value: str) -> list[str]:
@@ -180,6 +180,12 @@ def _build_match(query: str, drop_identifiers: bool = False) -> str:
         # same way the index is segmented and OR the resulting tokens, so a
         # synonym contributes its real tokens instead of an unmatchable
         # phrase. Single-token terms are unaffected (one token in, one out).
+        #
+        # Character n-grams are deliberately NOT added here: they make a
+        # meaningless query ("完全不存在的术语xyz") hit random prose through
+        # common unigrams, which the no-hit contract (empty result + hint)
+        # must preserve. The ``app.index.seg`` n-gram tokenizer ships as an
+        # explicit capability for the Context Hub engine, out of this path.
         part_tokens = [tok for tok in seg_index(word).split() if tok]
         for token in part_tokens or [word]:
             terms.append(_quote(token))
@@ -898,6 +904,36 @@ def _next_steps(hits: list[dict]) -> list[dict]:
     return steps[:3]
 
 
+def _limit_per_doc(
+    results: list[dict], distinct_docs: int | None = 2
+) -> list[dict]:
+    """Cap hits per document so a single document cannot flood a results page.
+
+    ``None`` disables the cap. Exact section/title hits (route channels that
+    answer "where is X") are kept whole regardless — the cap only trims the
+    BM25 body tail, which is where one JD or one chapter can dominate the
+    top N with near-duplicate chunks. Order is preserved: first N of each
+    doc, then everything kept re-flattened in original rank order.
+    """
+    if distinct_docs is None:
+        return results
+    counts: dict[str, int] = {}
+    kept: list[dict] = []
+    for hit in results:
+        doc_id = hit.get("doc_id")
+        match_type = hit.get("match_type")
+        if (
+            doc_id
+            and match_type not in {"section", "title"}
+            and counts.get(doc_id, 0) >= distinct_docs
+        ):
+            continue
+        if doc_id and match_type not in {"section", "title"}:
+            counts[doc_id] = counts.get(doc_id, 0) + 1
+        kept.append(hit)
+    return kept
+
+
 async def _miss_hints(
     db: AsyncSession,
     query: str,
@@ -938,9 +974,14 @@ async def scoped_search(
     doc_ids: list[str] | None = None,
     filters: dict | None = None,
     mode: str = "auto",
+    distinct_docs: int | None = 2,
 ) -> dict:
     """Search, optionally narrowed by collection and metadata filters.
 
+    ``distinct_docs`` caps how many hits a single document may contribute
+    (default 2), so one document never floods a results page; ``None``
+    disables the cap. Exact section/title hits are kept whole — the cap only
+    trims the BM25 body tail, which is where one document can dominate.
     ``mode`` accepts ``auto|lexical|semantic|hybrid`` (an unknown value is a
     ``ValueError``; the MCP layer turns it into a ToolError). Only lexical
     retrieval exists this round, so every mode runs the lexical pass:
@@ -977,6 +1018,7 @@ async def scoped_search(
     def _envelope(
         results: list[dict], empty_reason: str | None, hints: list[str]
     ) -> dict:
+        results = _limit_per_doc(results, distinct_docs)
         results = _decorate_pages(results)
         return {
             "results": results,

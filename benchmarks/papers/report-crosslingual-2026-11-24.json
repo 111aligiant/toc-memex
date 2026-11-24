@@ -1,0 +1,200 @@
+{
+  "db": "data\\eval\\spike.db",
+  "golden": "benchmarks\\papers\\golden-crosslingual.jsonl",
+  "top_k": 5,
+  "totals": {
+    "queries": 4,
+    "hit_at_k": 0.75,
+    "primary_at_1": 0.0,
+    "page_at_1": 0.25,
+    "mrr": 0.4167,
+    "citation_page_rate": 1.0,
+    "citation_leak_rate": null,
+    "low_confidence_rate": 0.5,
+    "ask_page_rate": null
+  },
+  "by_kind": {
+    "crosslingual": {
+      "queries": 4,
+      "hit_at_k": 0.75,
+      "primary_at_1": 0.0,
+      "page_at_1": 0.25,
+      "mrr": 0.4167,
+      "citation_page_rate": 1.0,
+      "citation_leak_rate": null,
+      "low_confidence_rate": 0.5,
+      "ask_page_rate": null
+    }
+  },
+  "no_answer_rows": [],
+  "rows": [
+    {
+      "id": "p-jecs-02",
+      "kind": "crosslingual",
+      "query": "实验装置中的反应器如何设计？",
+      "retrieval": {
+        "id": "p-jecs-02",
+        "query": "实验装置中的反应器如何设计？",
+        "kind": "crosslingual",
+        "scored": true,
+        "empty_reason": null,
+        "result_count": 5,
+        "page_basis": "pdf",
+        "top_doc": "56438aef",
+        "top_heading": "3.2",
+        "top_pages": [
+          [
+            45,
+            49
+          ]
+        ],
+        "top_match_type": "bm25",
+        "hit_at_k": true,
+        "correct_rank": 3,
+        "mrr": 0.3333333333333333,
+        "primary_at_1": false,
+        "page_at_1": false
+      },
+      "read_section": {
+        "id": "p-jecs-02",
+        "kind": "crosslingual",
+        "node_id": "4cc787f8-e5ff-4317-b39a-4c291494c08b:t:2a70e6fa",
+        "doc_id": "4cc787f8-e5ff-4317-b39a-4c291494c08b",
+        "page_basis": "pdf",
+        "citation_page_ok": true,
+        "leak": null,
+        "confidence": "low",
+        "fallback": "page_range",
+        "content_empty": false,
+        "error": null
+      },
+      "ask": null
+    },
+    {
+      "id": "p-jecs-03",
+      "kind": "crosslingual",
+      "query": "液铝颗粒在 NH3 中的氮化机理是什么？",
+      "retrieval": {
+        "id": "p-jecs-03",
+        "query": "液铝颗粒在 NH3 中的氮化机理是什么？",
+        "kind": "crosslingual",
+        "scored": true,
+        "empty_reason": null,
+        "result_count": 5,
+        "page_basis": "pdf",
+        "top_doc": "4cc787f8",
+        "top_heading": null,
+        "top_pages": [
+          [
+            2,
+            2
+          ]
+        ],
+        "top_match_type": "bm25",
+        "hit_at_k": true,
+        "correct_rank": 3,
+        "mrr": 0.3333333333333333,
+        "primary_at_1": false,
+        "page_at_1": false
+      },
+      "read_section": {
+        "id": "p-jecs-03",
+        "kind": "crosslingual",
+        "node_id": "4cc787f8-e5ff-4317-b39a-4c291494c08b:t:a387b0ac",
+        "doc_id": "4cc787f8-e5ff-4317-b39a-4c291494c08b",
+        "page_basis": "pdf",
+        "citation_page_ok": true,
+        "leak": null,
+        "confidence": "low",
+        "fallback": "page_range",
+        "content_empty": false,
+        "error": null
+      },
+      "ask": null
+    },
+    {
+      "id": "p-am-02",
+      "kind": "crosslingual",
+      "query": "化学溶液法外延金属氮化物薄膜的关键步骤是什么？",
+      "retrieval": {
+        "id": "p-am-02",
+        "query": "化学溶液法外延金属氮化物薄膜的关键步骤是什么？",
+        "kind": "crosslingual",
+        "scored": true,
+        "empty_reason": null,
+        "result_count": 5,
+        "page_basis": "pdf",
+        "top_doc": "3fb8d3ce",
+        "top_heading": null,
+        "top_pages": [
+          [
+            1,
+            5
+          ]
+        ],
+        "top_match_type": "bm25",
+        "hit_at_k": true,
+        "correct_rank": 1,
+        "mrr": 1.0,
+        "primary_at_1": false,
+        "page_at_1": true
+      },
+      "read_section": {
+        "id": "p-am-02",
+        "kind": "crosslingual",
+        "node_id": "3fb8d3ce-4af4-4fb3-afc3-a1afdb232501:root",
+        "doc_id": "3fb8d3ce-4af4-4fb3-afc3-a1afdb232501",
+        "page_basis": "pdf",
+        "citation_page_ok": true,
+        "leak": null,
+        "confidence": "high",
+        "fallback": "chunk_range",
+        "content_empty": false,
+        "error": null
+      },
+      "ask": null
+    },
+    {
+      "id": "p-am-03",
+      "kind": "crosslingual",
+      "query": "薄膜的 XRD 与显微表征说明了什么？",
+      "retrieval": {
+        "id": "p-am-03",
+        "query": "薄膜的 XRD 与显微表征说明了什么？",
+        "kind": "crosslingual",
+        "scored": true,
+        "empty_reason": null,
+        "result_count": 5,
+        "page_basis": "pdf",
+        "top_doc": "2bd433a0",
+        "top_heading": "3.4.4.1",
+        "top_pages": [
+          [
+            39,
+            39
+          ]
+        ],
+        "top_match_type": "bm25",
+        "hit_at_k": false,
+        "correct_rank": null,
+        "mrr": 0.0,
+        "primary_at_1": false,
+        "page_at_1": false
+      },
+      "read_section": {
+        "id": "p-am-03",
+        "kind": "crosslingual",
+        "node_id": "3fb8d3ce-4af4-4fb3-afc3-a1afdb232501:root",
+        "doc_id": "3fb8d3ce-4af4-4fb3-afc3-a1afdb232501",
+        "page_basis": "pdf",
+        "citation_page_ok": true,
+        "leak": null,
+        "confidence": "high",
+        "fallback": "chunk_range",
+        "content_empty": false,
+        "error": null
+      },
+      "ask": null
+    }
+  ]
+}
