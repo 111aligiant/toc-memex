@@ -24,3 +24,9 @@ web/shots/
 # 本地内部资料/评测语料，不发布
 .superpowers/
 tests/golden/
+
+# 本地设计/spike/定位文档，公开仓库不含 docs/
+docs/
+
+# DeepSeek-Harness 本机插件配置（含绝对路径），不发布
+.dsh-bundles/

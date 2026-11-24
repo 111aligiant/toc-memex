@@ -14,8 +14,7 @@ provider by default, local providers supported.
 
 A 60-second demo: ingest a paper folder, ask for a comparison, get every
 sentence cited to a page, then leave one erratum that a second session picks
-up. The shot list lives in [`docs/demo.md`](docs/demo.md); the recording is
-pending.
+up. A demo recording is planned.
 
 ## Requirements
 
@@ -91,8 +90,7 @@ second product, and not part of the first release story.
 ## Benchmark
 
 Retrieval and page-citation benchmark on five documents, 16 hand-checked
-questions, deterministic and LLM-free. Every number comes from a committed
-report in [`benchmarks/papers/`](benchmarks/papers/README.md).
+questions, deterministic and LLM-free.
 
 | metric | value |
 | --- | --- |
@@ -102,19 +100,17 @@ report in [`benchmarks/papers/`](benchmarks/papers/README.md).
 | citation_leak_rate | 0.00% |
 | MRR | 0.5781 |
 
-Method, failure cases and limitations: [`docs/benchmark-papers.md`](docs/benchmark-papers.md).
-Reproduce:
+Method, failure cases and limitations are collected in the project wiki.
+Reproduce (needs a local corpus):
 
 ```bash
-python scripts/run_eval.py retrieval \
-  --db data/eval/spike.db \
-  --golden benchmarks/papers/golden.jsonl
+python scripts/run_eval.py retrieval --db <db> --golden <golden.jsonl> --top-k 5
 ```
 
 ## Docs
 
-Start at [`docs/README.md`](docs/README.md). OCR providers are documented in
-[`docs/ocr-providers.md`](docs/ocr-providers.md).
+Design and spike notes live in a private `docs/` folder kept out of this
+repository. OCR providers are documented in [`.env.example`](.env.example).
 
 
 ## Quick start (development)
@@ -209,7 +205,8 @@ is in `.env.example`; the main groups are:
 | `TOCMEMEX_ALLOW_NONLOCAL` | Allow binding the web/API service to a non-loopback host |
 
 Provider-specific keys: `PADDLEOCR_API_TOKEN`, `MISTRAL_API_KEY`, `MINERU_API_TOKEN`,
-`AZURE_DI_ENDPOINT` / `AZURE_DI_KEY`. See [`docs/ocr-providers.md`](docs/ocr-providers.md).
+`AZURE_DI_ENDPOINT` / `AZURE_DI_KEY`. All providers are configured via
+[`.env.example`](.env.example).
 
 The web UI can also store model and OCR endpoints in the database; the settings page
 manages them at runtime without editing `.env`.
@@ -234,7 +231,6 @@ It is used by both body search and TOC-title matching.
 ```
 app/                 # ingest, OCR, index, curation, agent, MCP, Web API, CLI, inspector
 web/                 # Vue 3 + Vite frontend (build output: web/dist)
-docs/                # OCR providers, agent identity
 scripts/             # backup, smoke test, TOC probe, stats, curator task installer
 tests/               # pytest
 vendor/pageindex/    # MIT-licensed PageIndex code (see LICENSE / NOTICE)
