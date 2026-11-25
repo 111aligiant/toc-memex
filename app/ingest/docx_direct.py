@@ -34,6 +34,44 @@ _UNNUMBERED_TOP_LEVEL = {
     "目 录",
 }
 
+# Resumes and flyers typeset section titles by hand (bold + a rule line)
+# while every paragraph style stays Normal/Body Text, so Word reports no
+# outline level and there is no heading number. These names are the
+# structure the reader sees; without them the whole document is one flat
+# 全文 node and a search for "项目经历" can only hit mid-chunk.
+_SECTION_NAMES = {
+    "核心优势",
+    "个人优势",
+    "教育经历",
+    "教育背景",
+    "工作经历",
+    "工作经验",
+    "实习经历",
+    "项目经历",
+    "项目经验",
+    "技能特长",
+    "专业技能",
+    "技能",
+    "自我评价",
+    "个人总结",
+    "获奖情况",
+    "荣誉证书",
+    "证书",
+    "联系方式",
+    "个人信息",
+}
+_SECTION_DECOR = re.compile(r"^[\s/|｜·•\-—_]+|[\s/|｜·•\-—_]+$")
+
+
+def _section_name_heading(text: str) -> bool:
+    """A short line that is exactly a known section title (resume layout)."""
+    compact = _SECTION_DECOR.sub("", text)
+    return (
+        0 < len(compact) <= 12
+        and "".join(compact.split()) in
+        {"".join(name.split()) for name in _SECTION_NAMES}
+    )
+
 
 def _clean_paragraph(raw: str) -> str:
     """Drop Word control marks while keeping tabs (TOC lines need them)."""
@@ -194,6 +232,9 @@ def parse_word_document(doc) -> ParsedDocument:
             if detected is not None:
                 is_heading = True
                 heading_num, _, level = detected
+            elif _section_name_heading(text):
+                is_heading = True
+                heading_num, level = None, 1
         # "（规范性附录）导则" is the subtitle of the appendix heading on the
         # line before it, not a heading of its own.
         if text.startswith(("(", "（")) and "附录" in re.sub(r"\s+", "", text):

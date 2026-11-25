@@ -126,3 +126,34 @@ def test_image_only_docx_is_not_treated_as_text():
 
     text_doc = FakeDoc(_positions(["正文" * 100 + "\r"]), [0])
     assert _docx_direct_has_text(parse_word_document(text_doc))
+
+
+def test_hand_typeset_resume_sections_become_headings():
+    """Resumes keep every paragraph Normal/Body Text and draw section titles
+    by hand; the known section names carry the structure."""
+    paras = _positions(
+        [
+            "/ 核心优势\n",
+            "AI产品从0到1落地能力：主导智能助手产品闭环。\n",
+            "教育经历\n",
+            "某大学 计算机科学与技术 本科\n",
+            "/  项目经历\n",
+            "检测AI助手平台：负责产品定义与MVP落地。\n",
+            "/  技能特长\n",
+            "产品管理：需求调研与PRD撰写。\n",
+        ]
+    )
+    parsed = parse_word_document(FakeDoc(paras, [0]))
+    assert [bookmark.title for bookmark in parsed.bookmarks] == [
+        "/ 核心优势",
+        "教育经历",
+        "/  项目经历",
+        "/  技能特长",
+    ]
+    assert [bookmark.level for bookmark in parsed.bookmarks] == [1, 1, 1, 1]
+    headings = [
+        block.content
+        for block in parsed.pages[0].blocks
+        if block.label == "paragraph_title"
+    ]
+    assert headings == ["/ 核心优势", "教育经历", "/  项目经历", "/  技能特长"]
