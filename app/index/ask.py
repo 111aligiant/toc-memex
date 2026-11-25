@@ -4,9 +4,28 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Document
+from ..models import Chunk, Document
 from .fts import scoped_search
 from .sections import read_section
+
+
+def _page_fields(
+    page_start: int | None, page_end: int | None
+) -> dict[str, Any]:
+    """Citation pages: 0-based internal plus the 1-based pages agents cite.
+
+    Search/read_section already expose ``pdf_page_*``; ask must speak the
+    same language or an agent citing an ask answer reports the wrong PDF
+    page (the 0-based ``page_start``). Printed labels are not stored yet.
+    """
+    return {
+        "page_start": page_start,
+        "page_end": page_end,
+        "pdf_page_start": page_start + 1 if isinstance(page_start, int) else None,
+        "pdf_page_end": page_end + 1 if isinstance(page_end, int) else None,
+        "printed_page_start": None,
+        "printed_page_end": None,
+    }
 
 
 def _citation(
@@ -16,30 +35,32 @@ def _citation(
     max_snippet: int = 240,
 ) -> dict[str, Any]:
     if section is not None:
-        return {
+        citation = {
             "doc_id": section["doc_id"],
             "doc_title": doc_title,
             "node_id": section["node_id"],
             "heading_num": section["heading_num"],
             "heading_path": section["heading_path"],
-            "page_start": section["page_start"],
-            "page_end": section["page_end"],
             "chunk_ids": section["chunk_ids"],
             "snippet": (section.get("content") or "")[:max_snippet],
             "collection": hit.get("collection"),
         }
-    return {
+        citation.update(
+            _page_fields(section["page_start"], section["page_end"])
+        )
+        return citation
+    citation = {
         "doc_id": hit["doc_id"],
         "doc_title": doc_title,
         "node_id": hit.get("node_id"),
         "heading_num": hit.get("heading_num"),
         "heading_path": hit.get("heading_path", ""),
-        "page_start": hit.get("page_start"),
-        "page_end": hit.get("page_end"),
         "chunk_ids": hit.get("chunk_ids", []),
         "snippet": (hit.get("snippet") or "")[:max_snippet],
         "collection": hit.get("collection"),
     }
+    citation.update(_page_fields(hit.get("page_start"), hit.get("page_end")))
+    return citation
 
 
 async def ask_question(
@@ -102,6 +123,24 @@ async def ask_question(
     else:
         answer = primary.get("snippet") or ""
 
+    # A flat document (one 全文 node, or a very long chapter) starts at its
+    # first paragraphs, so a section answer never reaches a match that sits
+    # in "项目经历" halfway down. When the matched chunk is well inside the
+    # node, answer from that chunk instead; the citation narrows to it.
+    use_chunk = False
+    matched_chunk_id = primary.get("chunk_id")
+    section_chunks = (section or {}).get("chunk_ids") or []
+    if matched_chunk_id is not None:
+        try:
+            position = section_chunks.index(matched_chunk_id)
+        except ValueError:
+            position = -1
+        if section is None or position >= 2:
+            chunk = await db.get(Chunk, matched_chunk_id)
+            if chunk is not None and (chunk.content or "").strip():
+                answer = chunk.content
+                use_chunk = True
+
     if len(answer) > max_chars:
         answer = answer[:max_chars].rstrip() + "…"
 
@@ -109,7 +148,7 @@ async def ask_question(
         _citation(
             primary,
             titles.get(primary["doc_id"], primary["doc_id"]),
-            section,
+            None if use_chunk else section,
         )
     ]
     seen = {(primary["doc_id"], primary.get("node_id"))}

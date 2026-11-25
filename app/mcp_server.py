@@ -862,6 +862,10 @@ async def ask(
 ) -> dict:
     """Extractive answer with section citations.
 
+    Every citation carries the 0-based internal ``page_start/page_end`` and
+    the 1-based ``pdf_page_start/pdf_page_end``; cite ``pdf_page_*`` (the
+    same field search and read_section expose), not ``page_start``.
+
     ``collection`` narrows retrieval to one topic area (id, exact name, or
     "unassigned"). Citations carry their ``collection``; a zero-hit scoped
     answer explains which collections do have hits. Retrieval is

@@ -642,6 +642,12 @@ async def test_ask_returns_section_answer_with_citation(tmp_path):
     assert citation["node_id"] == "d1:8.3"
     assert citation["heading_path"].endswith("8.3 振动试验要求")
     assert citation["page_start"] == 12
+    # Agents cite PDF pages: ask must expose the same 1-based fields as
+    # search and read_section, not only the 0-based internal page_start.
+    assert citation["pdf_page_start"] == 13
+    assert citation["pdf_page_end"] >= 13
+    assert citation["printed_page_start"] is None
+    assert citation["printed_page_end"] is None
     node_ids = [item["node_id"] for item in result["citations"]]
     assert len(node_ids) == len(set(node_ids))
 
