@@ -45,7 +45,7 @@ Toc Memex 把一摞本地 PDF / 扫描件 / Word / Markdown 变成一台随时�
 
 - **OCR** —— [PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) 提供结构化输出（`parsing_res_list` 的 label / bbox / order），是目录重建与页码对齐的原始依据。
 - **LLM 接入** —— [magpie](https://github.com/yetone/magpie) 本地模型网关提供低成本模型调用，Toc Memex 用 `/api/endpoints/magpie/probe` 探测本机默认端口。
-- **目录结构处理** —— [PageIndex](https://github.com/VectifyAI/PageIndex)（MIT）。书签/目录解析的核心逻辑取自它，见 [`vendor/pageindex/`](vendor/pageindex/NOTICE.md)。
+- **目录结构处理** —— [PageIndex](https://github.com/VectifyAI/PageIndex)（MIT）。书签/目录解析的逻辑借鉴它，见 [`vendor/pageindex/`](vendor/pageindex/NOTICE.md)。
 - **离线 PDF 引擎** —— [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（PDFium 绑定）读 PDF 书签、提文本、渲染；[pdfplumber](https://github.com/jsvine/pdfplumber) 提供表格与版面矩形。
 
 ## 快速开始 · Quick start
