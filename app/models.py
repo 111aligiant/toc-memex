@@ -274,6 +274,13 @@ class IngestRun(Base):
     toc_source: Mapped[str | None] = mapped_column(String(30), nullable=True)
     node_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Bookmarks the parser offered the TOC builder. A larger number than
+    # node_count means entries were dropped on the way into the tree — the
+    # quality page shows both so a silently lost section is visible.
+    bookmark_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # JSON list of 0-based pages whose text layer decoded to mojibake and
+    # whose blocks were therefore not indexed. ``force_ocr`` re-reads them.
+    garbled_pages: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ok")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)

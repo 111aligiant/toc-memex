@@ -61,6 +61,40 @@ _PUA_OR_REPLACEMENT = re.compile(r"[-�]")
 _DIGITS = set("0123456789０１２３４５６７８９")
 
 
+# Broken font mappings surface as literal ``(cid:NN)`` placeholders (from
+# pdfplumber's cell text) or as C0 control characters used as word
+# separators. A block carrying either is not text a user can read, even
+# though its characters pass the "meaningful ratio" check.
+_CID_TOKEN = "(cid:"
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def block_text_garbled(text: str) -> bool:
+    """True when a text block is a broken-decoding stream, not prose."""
+    if not text:
+        return False
+    if text.count(_CID_TOKEN) >= 3:
+        return True
+    controls = len(_CONTROL_CHARS.findall(text))
+    return controls >= 3 and controls / max(len(text), 1) >= 0.01
+
+
+def drop_garbled_blocks(pages: list[OcrPage]) -> set[int]:
+    """Remove unreadable blocks in place; return the pages they came from."""
+    garbled_pages: set[int] = set()
+    for page in pages:
+        kept: list[OcrBlock] = []
+        for block in page.blocks:
+            if block.label in ("text", "paragraph_title") and block_text_garbled(
+                block.content
+            ):
+                garbled_pages.add(page.page_index)
+                continue
+            kept.append(block)
+        page.blocks = kept
+    return garbled_pages
+
+
 def _digit_signal_broken(text: str) -> bool:
     """True when the layer kept measurement symbols but dropped every digit.
 
@@ -239,6 +273,7 @@ def parse_pdf_text(path: Path) -> ParsedDocument | None:
         doc.close()
 
     toc_pages = _toc_pages(pages)
+    garbled_pages = drop_garbled_blocks(pages)
     for page_index in toc_pages:
         pages[page_index].blocks = [
             OcrBlock("text", block.content, block.bbox, block.order)
@@ -277,5 +312,12 @@ def parse_pdf_text(path: Path) -> ParsedDocument | None:
     return ParsedDocument(
         pages=pages,
         bookmarks=bookmarks,
-        metadata={"format": "pdf-text", "toc_pages": sorted(toc_pages)},
+        metadata={
+            "format": "pdf-text",
+            "toc_pages": sorted(toc_pages),
+            # Pages whose text layer decoded to mojibake. Their blocks were
+            # dropped: indexing them would answer questions with garbage.
+            # The quality page surfaces this so the user can force_ocr.
+            "garbled_pages": sorted(garbled_pages),
+        },
     )

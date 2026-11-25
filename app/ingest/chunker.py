@@ -15,6 +15,11 @@ _SKIP_LABELS = set(SKIP_LABELS) | {"number"}
 
 _HEADING_LABELS = {"paragraph_title", "doc_title"}
 _TITLE_STRIP = re.compile(r"[\s:：,，。.、;；\-—–]+")
+# C0 controls other than tab/newline are text-layer artifacts (pdfium uses
+# \x02 as a break marker inside a word). They must be visible to the
+# garbled-page detector, so they are removed here, at chunk creation,
+# rather than at parse time.
+_CONTROL_NOISE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 @dataclass
@@ -233,15 +238,21 @@ def _split_segment(
     full = "".join(full_parts)
 
     start = 0
+    # A text layer can be one enormous line (a broken font mapping turns
+    # every glyph run into an unbroken string). Cutting at the only space
+    # near the beginning would emit a sliver, and advancing by one character
+    # would then emit one chunk per character position. Only honour a
+    # boundary that leaves a substantial chunk; otherwise hard-cut.
+    min_cut = max(1, max_chars // 4)
     while start < len(full):
         end = min(len(full), start + max_chars)
         if end < len(full):
             cut = full.rfind("\n", start, end)
             if cut <= start:
                 cut = full.rfind(" ", start, end)
-            if cut > start:
+            if cut - start >= min_cut:
                 end = cut
-        content = full[start:end].strip()
+        content = _CONTROL_NOISE.sub("", full[start:end]).strip()
         if content:
             page_start, page_end = _page_span(offsets, start, end)
             chunks.append(

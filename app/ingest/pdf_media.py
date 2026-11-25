@@ -434,6 +434,10 @@ def attach_pdf_text_media(
     toc_pages = set(parsed.metadata.get("toc_pages") or [])
     if not toc_pages:
         toc_pages = _toc_pages(parsed.pages)
+    # A page whose text layer failed to decode cannot be trusted for table
+    # text either: pdfplumber reads it as ``(cid:NN)`` placeholders, and a
+    # misdetected prose "table" then duplicates the garbage into chunks.
+    garbled_pages = set(parsed.metadata.get("garbled_pages") or [])
     try:
         document = pdfplumber.open(str(path))
     except Exception:
@@ -450,6 +454,8 @@ def attach_pdf_text_media(
             for page_index, model in enumerate(parsed.pages):
                 if page_index >= len(document.pages):
                     break
+                if page_index in garbled_pages:
+                    continue
                 try:
                     _attach_page(
                         document.pages[page_index],

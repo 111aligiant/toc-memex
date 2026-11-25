@@ -640,6 +640,8 @@ def _record_parse(
             or (ocr_settings.tocmemex_ocr_provider if ocr_used and ocr_settings else None),
             "ocr_model": (meta.get("ocr_model") if ocr_used else None),
             "ocr_job_id": meta.get("job_id") if ocr_used else None,
+            "bookmark_count": len(parsed.bookmarks or []),
+            "garbled_pages": list(meta.get("garbled_pages") or []),
         }
     )
 
@@ -1319,7 +1321,8 @@ async def _open_ingest_row(
 
 def _split_plain_text(text_value: str, max_chars: int, overlap: int) -> list[str]:
     """Size-based split for the image text mode (no headings to split on)."""
-    value = re.sub(r"\n{3,}", "\n\n", text_value or "").strip()
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text_value or "")
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if not value:
         return []
     max_chars = max(1, max_chars)

@@ -14,6 +14,7 @@ never claims a provider or model it cannot show evidence for.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,6 +62,7 @@ def build_run(
         file_exists, file_size = False, None
 
     ocr_used = bool(parse.get("ocr_used"))
+    garbled = parse.get("garbled_pages") or []
     return IngestRun(
         doc_id=doc.id,
         recorded_by=recorded_by,
@@ -85,6 +87,8 @@ def build_run(
         toc_source=trace.get("channel") or _latest_toc_source(nodes or []),
         node_count=len(nodes) if nodes is not None else None,
         chunk_count=chunk_count,
+        bookmark_count=parse.get("bookmark_count"),
+        garbled_pages=json.dumps(sorted(garbled)) if garbled else None,
         status=status,
         error=error,
         created_at=utcnow_iso(),
@@ -131,6 +135,10 @@ def run_out(row: IngestRun) -> dict:
         "toc_source": row.toc_source,
         "node_count": row.node_count,
         "chunk_count": row.chunk_count,
+        "bookmark_count": row.bookmark_count,
+        "garbled_pages": (
+            json.loads(row.garbled_pages) if row.garbled_pages else []
+        ),
         "status": row.status,
         "error": row.error,
         "created_at": row.created_at,
@@ -152,6 +160,8 @@ def provenance_summary(row: IngestRun | None) -> dict:
             "file_exists": None,
             "recorded_by": None,
             "toc_source": None,
+            "bookmark_count": None,
+            "garbled_pages": [],
         }
     if row.ocr_used:
         ocr_label = row.ocr_provider or "ocr"
@@ -165,6 +175,16 @@ def provenance_summary(row: IngestRun | None) -> dict:
             "markdown": "Markdown",
             "xlsx": "Excel",
         }.get(row.parse_channel or "", row.parse_channel)
+    raw_garbled = getattr(row, "garbled_pages", None)
+    if isinstance(raw_garbled, str) and raw_garbled:
+        try:
+            garbled_pages = json.loads(raw_garbled)
+        except ValueError:
+            garbled_pages = []
+    elif isinstance(raw_garbled, list):
+        garbled_pages = raw_garbled
+    else:
+        garbled_pages = []
     return {
         "ocr_label": ocr_label,
         "ocr_used": bool(row.ocr_used),
@@ -173,6 +193,8 @@ def provenance_summary(row: IngestRun | None) -> dict:
         "file_exists": bool(row.file_exists),
         "recorded_by": row.recorded_by,
         "toc_source": row.toc_source,
+        "bookmark_count": getattr(row, "bookmark_count", None),
+        "garbled_pages": garbled_pages,
     }
 
 

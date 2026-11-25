@@ -134,6 +134,15 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
                 )
             )
 
+    # ingest_runs: structural quality evidence. bookmark_count is what the
+    # parser offered the TOC builder; garbled_pages is the JSON list of pages
+    # whose text layer decoded to mojibake and was therefore not indexed.
+    for column, ddl in (
+        ("bookmark_count", "INTEGER"),
+        ("garbled_pages", "TEXT"),
+    ):
+        await _add_column_if_missing(conn, "ingest_runs", column, ddl)
+
     # documents: live ingest progress (stage / percent / parse scheme) shown
     # by the 解析队列 page. Written before parsing starts so the queue can
     # list a document while OCR is still running.

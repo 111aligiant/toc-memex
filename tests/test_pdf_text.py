@@ -128,3 +128,33 @@ def test_digit_signal_passes_normal_technical_text():
 def test_digit_signal_ignores_non_cjk_text():
     latin = "The sample was heated at 25 ± 0.5 C with %RH symbols only ± × % ° °"
     assert _digit_signal_broken(latin) is False
+
+
+def test_garbled_blocks_are_detected():
+    from app.ingest.pdf_text import block_text_garbled
+
+    assert block_text_garbled(
+        "(cid:50)(cid:69)(cid:86)(cid:88)\x03RULJLQDOO\\x03GHVLJQHG"
+    )
+    assert block_text_garbled("word\x03word\x03word\x03word")
+    assert not block_text_garbled("Recurrent neural networks are established.")
+
+
+def test_garbled_blocks_are_dropped_and_pages_marked():
+    from app.ingest.pdf_text import drop_garbled_blocks
+
+    pages = [
+        OcrPage(0, 100, 200, "", [OcrBlock("text", "A" * 400, (0, 0, 9, 9), 1)], {}, {}),
+        OcrPage(
+            1,
+            100,
+            200,
+            "",
+            [OcrBlock("text", "(cid:50)" * 40, (0, 0, 9, 9), 1)],
+            {},
+            {},
+        ),
+    ]
+    assert drop_garbled_blocks(pages) == {1}
+    assert len(pages[0].blocks) == 1
+    assert pages[1].blocks == []

@@ -468,3 +468,16 @@ def test_section_tail_on_next_page_stays_with_previous_node():
     assert [chunk.node_id for chunk in chunks] == ["d:1", "d:2"]
     assert "续文" in chunks[0].content
     assert "续文" not in chunks[1].content
+
+
+def test_unbroken_line_does_not_emit_one_chunk_per_character():
+    """A broken font mapping can produce one enormous line. Cutting at the
+    only early space must not emit slivers while start advances by one."""
+    text = "ab " + ("x" * 5000)
+    parsed = ParsedDocument(pages=[page(0, text)], bookmarks=[], metadata={})
+    toc = [
+        TocNodeData("d:root", None, 1, None, "root", "root", 0, 0, "fallback", 0.3)
+    ]
+    chunks = chunk_document(parsed, toc, max_chars=500, overlap=0)
+    assert len(chunks) <= 12
+    assert all(len(chunk.content) >= 400 for chunk in chunks[:-1])

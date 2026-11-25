@@ -125,6 +125,48 @@ def quality_groups(db_path: Path, data_dir: Path | None) -> list[dict]:
                     "docTitle": doc["title"],
                 }
             )
+        provenance = doc.get("provenance") or {}
+        garbled_pages = provenance.get("garbled_pages") or []
+        if garbled_pages:
+            shown = "、".join(str(page + 1) for page in garbled_pages[:8])
+            more = "…" if len(garbled_pages) > 8 else ""
+            groups.append(
+                {
+                    "id": issue_id(doc["id"], "garbled-text"),
+                    "kind": "garbled-text",
+                    "severity": "warning",
+                    "title": "文本层乱码",
+                    "count": len(garbled_pages),
+                    "desc": (
+                        f"{doc['title']} · PDF 第 {shown}{more} 页字体映射损坏，"
+                        "这些页没有入库；可用 OCR 重建"
+                    ),
+                    "docId": doc["id"],
+                    "docTitle": doc["title"],
+                }
+            )
+        bookmark_count = provenance.get("bookmark_count")
+        node_count = doc.get("nodes")
+        if (
+            isinstance(bookmark_count, int)
+            and isinstance(node_count, int)
+            and bookmark_count > node_count
+        ):
+            groups.append(
+                {
+                    "id": issue_id(doc["id"], "bookmark-dropped"),
+                    "kind": "bookmark-dropped",
+                    "severity": "warning",
+                    "title": "书签未全部入目录",
+                    "count": bookmark_count - node_count,
+                    "desc": (
+                        f"{doc['title']} · 书签 {bookmark_count} 条，"
+                        f"目录只有 {node_count} 个节点；可能有书签被丢弃"
+                    ),
+                    "docId": doc["id"],
+                    "docTitle": doc["title"],
+                }
+            )
         for issue in stats["issueMessages"]:
             if "duplicate" in issue["message"] or "重复" in issue["message"]:
                 groups.append(
