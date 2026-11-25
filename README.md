@@ -10,8 +10,6 @@
   <img src="https://img.shields.io/badge/interface-MCP-blue.svg?style=flat-square" alt="MCP" />
 </p>
 
-Toc Memex：
-
 把本地 PDF、扫描件、Word 与 Markdown 汇编成一个适用你所有Agent的图书馆藏：各切片对齐到小节，印刷页码对齐到 PDF 物理页。
 
 基于文档本身结构化目录树检索，高准确性低幻觉的多文档检索；适用于交付物需要原文与页码的场景：标准、法规、合同、专利、检测报告、审计底稿。
@@ -21,28 +19,7 @@ MCP层适配Workbuddy、DSH、claude code等多种常用Agent，外部会话动�
 内置双Agent，纲目Agent负责切片及目录优化，编修Agent负责修复文档及跟进手记区建议。
 
 ---
-## 快速开始
-
-安装后提供三个入口：`toc-memex`（CLI）、`toc-memex-mcp`（MCP）、`toc-memex-web`（Web，前端产物随包分发）。
-
-```bash
-pipx install git+https://github.com/111aligiant/toc-memex
-
-toc-memex init                                   # 建库
-toc-memex ingest path/to/document.pdf           # 入库一篇文档
-toc-memex search "8.3" --top 5                  # 章节号直达，返回带页码
-toc-memex-web                                    # 启动 Web 界面
-```
-
-不安装也可以直接启动 MCP server：
-
-```bash
-uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
-```
-
-`pip` 卡在无进度（部分 IPv6 网络）时换镜像：`--index-url https://pypi.tuna.tsinghua.edu.cn/simple`。
-
-### 入库演示
+## 入库演示
 
 Web 端上传同样可用：选文件、填入库备注，解析队列分阶段推进（抽取 → 目录重建 → 切片 → 索引），完成后文档带着页数与覆盖率出现在知识库。文本层 PDF 全程不调外部 API，扫描件才需要 OCR Key。
 
@@ -106,6 +83,27 @@ Web 的「任务」页把外部会话展开成活动时间线（读过哪一节�
 | ![任务时间线：阅读记录与章节锚点](assets/agent-tasks.png) | ![步骤回放：search 调用与检索命中](assets/agent-replay.png) |
 
 ![外部会话动态回放：展开任务时间线，逐步回放 search / read_section，最后留下手记](assets/agent-session.gif)
+
+## 快速开始
+
+安装后提供三个入口：`toc-memex`（CLI）、`toc-memex-mcp`（MCP）、`toc-memex-web`（Web，前端产物随包分发）。
+
+```bash
+pipx install git+https://github.com/111aligiant/toc-memex
+
+toc-memex init                                   # 建库
+toc-memex ingest path/to/document.pdf           # 入库一篇文档
+toc-memex search "8.3" --top 5                  # 章节号直达，返回带页码
+toc-memex-web                                    # 启动 Web 界面
+```
+
+不安装也可以直接启动 MCP server：
+
+```bash
+uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
+```
+
+`pip` 卡在无进度（部分 IPv6 网络）时换镜像：`--index-url https://pypi.tuna.tsinghua.edu.cn/simple`。
 
 ## Web 界面
 
