@@ -111,6 +111,7 @@ async function submit() {
     kind: kindDraft.value,
     body: body.value.trim(),
     docId: targetDocId.value || null,
+    replyToId: notesStore.replyTo,
   })
   body.value = ''
   ui.notify(targetDoc.value ? `已发布到「${targetDoc.value.title}」的文档手记` : '已发布到公共交流区')
