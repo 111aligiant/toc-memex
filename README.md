@@ -1,7 +1,6 @@
 <p align="center">
   <img src="assets/icon.png" width="96" alt="Toc Memex 图标" />
 </p>
-
 <h1 align="center">Toc Memex</h1>
 
 <p align="center">
@@ -11,38 +10,17 @@
   <img src="https://img.shields.io/badge/interface-MCP-blue.svg?style=flat-square" alt="MCP" />
 </p>
 
-Toc Memex 把本地 PDF、扫描件、Word 与 Markdown 编成一个可核对的馆藏：目录还原到小节，印刷页码对齐到 PDF 物理页，检索结果、引用、批注与勘误都落在同一个地址上（`doc_id → node_id → page`）。用于交付物需要原文与页码的场景：标准、法规、合同、专利、检测报告、审计底稿。索引与记录留在本地 SQLite，原始文件与 OCR 产物留在数据目录。
+Toc Memex：
 
-![概览：馆藏计数、待处理问题、任务与最近手记](assets/overview.png)
+把本地 PDF、扫描件、Word 与 Markdown 汇编成一个适用你所有Agent的图书馆藏：各切片对齐到小节，印刷页码对齐到 PDF 物理页。
+
+基于文档本身结构化目录树检索，高准确性低幻觉的多文档检索；适用于交付物需要原文与页码的场景：标准、法规、合同、专利、检测报告、审计底稿。
+
+MCP层适配Workbuddy、DSH、claude code等多种常用Agent，外部会话动态回放；手记区支持跨Agent留档交流。
+
+内置双Agent，纲目Agent负责切片及目录优化，编修Agent负责修复文档及跟进手记区建议。
 
 ---
-
-## 馆藏结构与检索
-
-文档入库后，章节树从 PDF 书签、印刷目录页、Word 标题样式或 OCR 段落标题重建，印刷页码映射到 1-based 的 PDF 物理页。检索与阅读接口统一返回 `doc_id`、`node_id`、`heading_path`、`pdf_page_start` / `pdf_page_end`。`read_section` 另给出 `citation_confidence`（`high` / `page` / `low`），按页码兜底时附带 `citation_note`；返回里包含该节已确认的勘误，以及挂到覆盖切片上的图 / 表资源。缺页、重复标题、短切片、页眉页脚混入、标题与声明页不符等结构问题在入库与巡检时记入质量信号。
-
-检索走 SQLite FTS5 BM25 + jieba，打分之前有确定性路由：章节号（`8.3`）、文档号（`ACME 100`）、分区过滤、查询中逐字出现的目录标题。没有 embedding、reranker 或 LLM 查询改写；请求 `semantic` / `hybrid` 时按词法检索执行，并在返回里置 `degraded=true` 与 `mode_note`。同义词和跨语言词表由 `TOCMEMEX_SEARCH_SYNONYMS` 配置，默认不启用。
-
-## 派生层的治理闭环
-
-| 层 | 内容 | 写入规则 |
-|---|---|---|
-| 原文层 | PDF / 图片 / Word 文件 | 永不修改 |
-| 派生层 | OCR 文本、TOC 节点与页码、切片边界与内容、元数据 | 经提案修改，带快照与回滚 |
-| 记录层 | 阅读、引用、批注、勘误、校勘记、交接 | 只追加，修正以新记录追加 |
-
-治理动作只作用于派生层。修正通过 `propose_ops` 提交：`correct_text`、`merge_chunks`、`split_chunk`、`drop_chunk` 等低风险操作可自动落地，`set_page`、`merge_nodes`、`split_node` 列为高风险、等待人工批准。每次应用前写快照，复测变差自动回滚（`auto_rollback`），之后仍可按提案 `undo`。`list_quality_signals` 提供只读的跨文档快照，把零命中查询、被反复检索却从未 `mark_used` 的文档、待批提案、近期自动回滚与勘误计数汇总在一处；编修 agent、MCP 与 `python -m app.curator signals` 拿到同一份 JSON。
-
-## 挂在源位置上的记录
-
-`activity`、`agent_notes`、`errata`、`usage_log`、`tasks` 以 `doc_id / node_id / page` 为锚点，不绑定会话。勘误生命周期是 `proposed → confirmed / rejected`，确认需要第二个 agent 独立复核，修正不覆盖旧记录而是追加新行。`task_timeline` 把同一任务的读写、批注与勘误合成一条时间线；`add_note` 与 `activity_write` 写入的交接和勘误会出现在下一次会话的检索与阅读结果里。未经 `confirmed` 的勘误不进入检索返回，`used / unused` 由 `mark_used` 单独记录。
-
-手记页是记录层的公共入口：按类型分组（笔记 / 踩坑 / 交接 / 入库备注），回复嵌套在原手记下方，刷新与下一次会话都能读到。
-
-![手记演示：设置身份 → 回复交接手记 → 嵌套展示](assets/notes-flow.gif)
-
-[查看 MP4 高清版](assets/notes-flow.mp4)。同样为 0.8× 放映、110% 页面缩放，底部字幕逐步讲解。
-
 ## 快速开始
 
 安装后提供三个入口：`toc-memex`（CLI）、`toc-memex-mcp`（MCP）、`toc-memex-web`（Web，前端产物随包分发）。
@@ -70,51 +48,33 @@ Web 端上传同样可用：选文件、填入库备注，解析队列分阶段�
 
 ![入库演示：上传对话框 → 解析队列分阶段推进 → 新文档就绪](assets/ingest-flow.gif)
 
-[查看 MP4 高清版](assets/ingest-flow.mp4)。演示上传的是公开论文 DDPM（arXiv:2006.11239）；解析队列等待段以 6× 快进，整体 0.8× 放映、110% 页面缩放，底部字幕逐步讲解。
+## 馆藏结构与检索
+
+文档入库后，章节树从 PDF 书签、印刷目录页、Word 标题样式或 OCR 段落标题重建，印刷页码映射到 1-based 的 PDF 物理页。检索与阅读接口统一返回 `doc_id`、`node_id`、`heading_path`、`pdf_page_start` / `pdf_page_end`。`read_section` 另给出 `citation_confidence`（`high` / `page` / `low`），按页码兜底时附带 `citation_note`；返回里包含该节已确认的勘误，以及挂到覆盖切片上的图 / 表资源。缺页、重复标题、短切片、页眉页脚混入、标题与声明页不符等结构问题在入库与巡检时记入质量信号。
+
+检索走 SQLite FTS5 BM25 + jieba，打分之前有确定性路由：章节号（`8.3`）、文档号（`ACME 100`）、分区过滤、查询中逐字出现的目录标题。没有 embedding、reranker 或 LLM 查询改写；请求 `semantic` / `hybrid` 时按词法检索执行，并在返回里置 `degraded=true` 与 `mode_note`。同义词和跨语言词表由 `TOCMEMEX_SEARCH_SYNONYMS` 配置，默认不启用。
+
+## 派生层的治理闭环
+
+| 层 | 内容 | 写入规则 |
+|---|---|---|
+| 原文层 | PDF / 图片 / Word 文件 | 永不修改 |
+| 派生层 | OCR 文本、TOC 节点与页码、切片边界与内容、元数据 | 经提案修改，带快照与回滚 |
+| 记录层 | 阅读、引用、批注、勘误、校勘记、交接 | 只追加，修正以新记录追加 |
+
+治理动作只作用于派生层。修正通过 `propose_ops` 提交：`correct_text`、`merge_chunks`、`split_chunk`、`drop_chunk` 等低风险操作可自动落地，`set_page`、`merge_nodes`、`split_node` 列为高风险、等待人工批准。每次应用前写快照，复测变差自动回滚（`auto_rollback`），之后仍可按提案 `undo`。`list_quality_signals` 提供只读的跨文档快照，把零命中查询、被反复检索却从未 `mark_used` 的文档、待批提案、近期自动回滚与勘误计数汇总在一处；编修 agent、MCP 与 `python -m app.curator signals` 拿到同一份 JSON。
+
+## 挂在源位置上的记录
+
+`activity`、`agent_notes`、`errata`、`usage_log`、`tasks` 以 `doc_id / node_id / page` 为锚点，不绑定会话。勘误生命周期是 `proposed → confirmed / rejected`，确认需要第二个 agent 独立复核，修正不覆盖旧记录而是追加新行。`task_timeline` 把同一任务的读写、批注与勘误合成一条时间线；`add_note` 与 `activity_write` 写入的交接和勘误会出现在下一次会话的检索与阅读结果里。未经 `confirmed` 的勘误不进入检索返回，`used / unused` 由 `mark_used` 单独记录。
+
+手记页是记录层的公共入口：按类型分组（笔记 / 踩坑 / 交接 / 入库备注），回复嵌套在原手记下方，刷新与下一次会话都能读到。
+
+![手记演示：设置身份 → 回复交接手记 → 嵌套展示](assets/notes-flow.gif)
 
 ## 外部 agent 接入
 
 Toc Memex 不替 agent 做判断，只提供带地址的工具面。外部 agent 经 MCP 连入后，握手时自报的 `client_info.name` 记为作者，服务端为连接分配 `session_id`，每次调用落一条 `tool_call` / `tool_result`。对一次调用一条连接的客户端（DSH、WorkBuddy 常见），同一客户端 30 分钟内的调用归并为一个「外部 agent 会话」任务，调用不会散成断线记录；`run_start` / `run_end` 可显式划界。
-
-![WorkBuddy 与 DSH 经 MCP 接入，调用归档为任务时间线并可在测试台回放](assets/agent-flow.svg)
-
-### WorkBuddy
-
-`~/.workbuddy/mcp.json`：
-
-```json
-{
-  "mcpServers": {
-    "toc-memex": {
-      "command": "toc-memex-mcp",
-      "env": { "TOCMEMEX_DB_PATH": "C:/your/data/tocmemex.db" }
-    }
-  }
-}
-```
-
-默认 `stdio`；客户端只支持 HTTP 时改用 `--transport streamable-http`（端口 8790）。默认工具面 8 个：`memex_overview` · `search` · `get_toc` · `read_section` · `add_note` · `mark_used` · `activity_write` · `propose_ops`；`TOCMEMEX_TOOLS=full` 展开治理、档案与页面级工具。其余配置见 [`.env.example`](.env.example)。
-
-### DSH
-
-在 profile 中插入一条 MCP server（`cordis.patch.yml`），同样以 stdio 直连本地 SQLite：
-
-```yaml
-- insert:
-    - id: mcp-toc-memex
-      name: '@deepseek-ai/dsh-mcp-client'
-      config:
-        serverName: toc-memex
-        transport: stdio
-        command: '<repo>/.venv/Scripts/python.exe'
-        args: ['-m', 'app.mcp_server']
-        cwd: '<repo>'
-        env:
-          TOCMEMEX_DB_PATH: '<repo>/data/tocmemex.db'
-          TOCMEMEX_DATA_DIR: '<repo>/data'
-```
-
-`<repo>` 换成仓库绝对路径。多个客户端各起一个进程、连同一个数据库文件，读写记录都落在同一处。
 
 ### 一次典型调用
 
@@ -147,10 +107,6 @@ Web 的「任务」页把外部会话展开成活动时间线（读过哪一节�
 
 ![外部会话动态回放：展开任务时间线，逐步回放 search / read_section，最后留下手记](assets/agent-session.gif)
 
-[查看 MP4 高清版](assets/agent-session.mp4)。动图 12 fps、110% 页面缩放，保留鼠标移动与点击反馈，底部字幕逐步讲解：任务页展开会话时间线 → 回放 `search` 与 `read_section` → 核对章节与页码 → `add_note` 留下手记。
-
-演示库只含公开论文 [Attention Is All You Need](https://arxiv.org/abs/1706.03762)、[BERT](https://arxiv.org/abs/1810.04805) 与 [DDPM](https://arxiv.org/abs/2006.11239)，不包含私人馆藏。画面中的 WorkBuddy 与 DSH 记录由 [`scripts/demo_ai_agents.py`](scripts/demo_ai_agents.py) 经 MCP 实际调用生成；入库与手记两条演示的录制见 [`scripts/shoot_flows.py`](scripts/shoot_flows.py)，手记内容由 [`scripts/demo_notes.py`](scripts/demo_notes.py) 写入（页码取自演示库目录）。
-
 ## Web 界面
 
 | 知识库列表 | 目录树与页码 |
@@ -164,15 +120,14 @@ Web 的「任务」页把外部会话展开成活动时间线（读过哪一节�
 ## 实现与规模
 
 - Python 3.12 / 3.13；SQLAlchemy + aiosqlite + SQLite FTS5；FastAPI；pypdfium2 / pdfplumber 读 PDF；jieba 分词；前端为预构建静态产物。
-- `app/` 约 3.26 万行、`tests/` 约 2.28 万行，79 个测试文件。本地全量 `pytest -q`（2026-11-25）：`898 passed, 1 skipped`。
 - 文本层文档的抽取、建目录与检索不调用外部 API，也没有按查询计费；扫描件 OCR 与治理裁决用的 LLM 为可选外部调用。
 - 索引与记录落在 `data/tocmemex.db` 与数据目录，`scripts/backup.py` 事务性备份两者。
 
 ## 适用范围与限制
 
-- 主要适配目录结构完整的规范文档（PDF 书签、印刷目录页或 Word 标题样式）。无目录的散页扫描件与二手资料适配有限。
-- Excel / CSV / TSV 在 CLI 与 Web 的分发点拒绝入库。
-- 词法检索对同义换词召回弱；跨语言检索依赖 `TOCMEMEX_SEARCH_SYNONYMS` 配置，默认不启用。
+- 主要适配目录结构完整的规范文档（PDF 书签、印刷目录页或 Word 标题样式）。
+- Excel / CSV / TSV 目前暂不支持。
+- 跨语言检索依赖 `TOCMEMEX_SEARCH_SYNONYMS` 配置，默认不启用。
 - OCR 默认走云端 PaddleOCR-VL，可换本地或私有 provider，`TOCMEMEX_OCR_ALLOW_PRIVATE_HOSTS=1` 放开内网端点。
 - DOCX / DOC 直读依赖 Word COM（仅 Windows）；没有 Word 时先转 PDF。
 - Web 服务无登录，默认只绑 `127.0.0.1`；对外暴露前看 `TOCMEMEX_ALLOW_NONLOCAL` 的说明。
