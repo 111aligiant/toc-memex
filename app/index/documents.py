@@ -173,14 +173,17 @@ async def ranked_document_ids(
     for doc_id in await doc_ids_from_query(db, query) or []:
         _bump(doc_id, 4.0)
 
-    like = f"%{query}%"
+    # LIKE 模式里的 % 与 _ 是通配符；查询串含字面 % / _ 时必须转义，
+    # 否则候选集退化为全表匹配（与 _toc_title_doc_ids 的处理保持一致）。
+    escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
     rows = (
         await db.execute(
             select(Document.id, Document.title, Document.filename, Document.keywords)
             .where(
-                Document.title.like(like)
-                | Document.filename.like(like)
-                | Document.keywords.like(like)
+                Document.title.like(like, escape="\\")
+                | Document.filename.like(like, escape="\\")
+                | Document.keywords.like(like, escape="\\")
             )
         )
     ).all()

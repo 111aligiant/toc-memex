@@ -330,8 +330,10 @@ async def _ask(args) -> int:
         print(result["answer"])
         print("\n来源：")
         for index, citation in enumerate(result["citations"], 1):
-            start = citation.get("page_start")
-            end = citation.get("page_end")
+            # ask 返回的 page_start/page_end 是 0-based 内部页；
+            # 面向用户必须打印 1-based 的 PDF 物理页（与 read_section 一致）。
+            start = citation.get("pdf_page_start")
+            end = citation.get("pdf_page_end")
             pages = f"{start}-{end}" if start is not None else "?"
             print(
                 f"[{index}] {citation['doc_title']} › "
