@@ -1405,3 +1405,83 @@ async def test_backfill_files_legacy_external_runs_and_their_records(tmp_path):
     # Idempotent: a second sweep has nothing left to file.
     assert await backfill_external_tasks(engine) == 0
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_end_accepts_run_id_from_another_connection(tmp_path, monkeypatch):
+    """One-call-one-connection clients cannot be matched by session at
+    run_end time; the run id is the handle that survives."""
+    db_path = await seed(tmp_path)
+    _patch_mcp_session(monkeypatch, db_path, session_id="conn-a")
+    from app import mcp_server
+
+    started = await mcp_server.server.call_tool(
+        "run_start", {"question": "跨连接任务"}
+    )
+    assert started.is_error is False
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        run = (await db.execute(select(AgentRun))).scalars().one()
+        run_id = run.id
+        assert run.status == "running"
+
+    # Next tool call arrives on a fresh connection.
+    monkeypatch.setattr(mcp_server, "_session_id", lambda ctx: "conn-b")
+    ended = await mcp_server.server.call_tool(
+        "run_end", {"status": "done", "answer": "完成", "run_id": run_id}
+    )
+    assert ended.is_error is False
+
+    async with session_factory(engine)() as db:
+        run = await db.get(AgentRun, run_id)
+        assert run.status == "done"
+        assert run.answer == "完成"
+        assert run.finished_at
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_runs_are_marked_abandoned_not_deleted(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from app.agent import external
+
+    db_path = await seed(tmp_path)
+    engine = make_engine(db_path)
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    async with session_factory(engine)() as db:
+        db.add(
+            AgentRun(
+                question="陈旧会话",
+                status="running",
+                source="mcp",
+                session_id="dead",
+                started_at=old,
+                last_seen_at=old,
+            )
+        )
+        db.add(
+            AgentRun(
+                question="新会话",
+                status="running",
+                source="mcp",
+                session_id="live",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                last_seen_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        await db.commit()
+
+        changed = await external.prune_stale_runs(db)
+        await db.commit()
+        assert changed == 1
+
+        runs = (
+            await db.execute(select(AgentRun).order_by(AgentRun.created_at))
+        ).scalars().all()
+        assert [run.status for run in runs] == ["abandoned", "running"]
+        stale = next(run for run in runs if run.session_id == "dead")
+        assert stale.error == "client vanished"
+        assert stale.finished_at
+    await engine.dispose()

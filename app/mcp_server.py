@@ -971,9 +971,10 @@ async def run_start(
     test bench). Pass task_id to attach the run to a task you created with
     task_create(); omit it and a new "外部会话" task is opened with this
     question as its title. One connection owns at most one running run;
-    starting another closes the previous one and its task. The run id is
-    informational — later calls are attributed by the server-assigned
-    session, not by passing the id around.
+    starting another closes the previous one and its task. Keep the returned
+    run id and pass it to run_end: a client that opens a fresh connection
+    per call cannot otherwise be matched to the run it started. Other calls
+    are still attributed by the server-assigned session.
     """
     client = _client_name(ctx) or actor_agent or None
     async with _session() as db:
@@ -1005,15 +1006,20 @@ async def run_end(
     status: str = "done",
     answer: str = "",
     error: str = "",
+    run_id: str = "",
     ctx: Context | None = None,
 ) -> dict:
-    """Close this connection's console run.
+    """Close a console run.
 
     Call it when the task is finished so the console stops showing the run
     as live and records the final answer. status is "done" (default) or
-    "failed"; on failure pass error. The answer is recorded as text — the
-    console cannot verify quotes from an external agent, so citations are
-    left empty rather than fabricated.
+    "failed"; on failure pass error. Pass the ``run_id`` returned by
+    run_start: clients that open a new connection per call (DSH, Claude
+    Code) cannot be identified by the connection at run_end time. Without
+    run_id the tool falls back to this connection's running run. Calling it
+    twice is harmless; the second call returns the already-closed run.
+    The answer is recorded as text — the console cannot verify quotes from
+    an external agent, so citations are left empty rather than fabricated.
     """
     if status not in ("done", "failed"):
         raise _tool_error(ValueError("status must be 'done' or 'failed'"))
@@ -1024,6 +1030,7 @@ async def run_end(
             status=status,
             answer=answer or None,
             error=error or None,
+            run_id=run_id.strip() or None,
         )
         await db.commit()
         if run is None:

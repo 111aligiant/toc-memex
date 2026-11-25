@@ -884,6 +884,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await backfill_external_tasks(_app_engine(app))
     except Exception:
         pass  # a migration must never keep the console from starting
+    # External runs whose client vanished are ghost "进行中" rows; the
+    # console shows history, not ghosts. Status-only: rows are kept.
+    from .agent.external import prune_stale_runs
+
+    try:
+        async with session_factory(_app_engine(app))() as session:
+            await prune_stale_runs(session)
+            await session.commit()
+    except Exception:
+        pass
     from .ingest.bench import fail_stale_processing_scenarios
 
     await fail_stale_processing_scenarios(session_factory(_app_engine(app)))
@@ -2903,6 +2913,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     async def api_runs(
         limit: int = Query(default=20, ge=1, le=100),
         source: str | None = Query(default=None),
+        include_abandoned: bool = Query(default=False),
     ) -> dict:
         """Run history, newest first.
 
@@ -2910,11 +2921,17 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         sessions are work, archived as tasks on the 任务 page. Their runs
         stay fetchable by id (the task page links to the trace) but are not
         mixed into the test bench history.
+
+        Runs whose client vanished are marked ``abandoned`` by the TTL sweep;
+        they are history, not live work, so the default listing leaves them
+        out. ``include_abandoned=true`` shows the full archive.
         """
         async with session_factory(engine())() as session:
             stmt = sqlalchemy.select(AgentRun).order_by(AgentRun.created_at.desc())
             if source:
                 stmt = stmt.where(AgentRun.source == source)
+            if not include_abandoned:
+                stmt = stmt.where(AgentRun.status != "abandoned")
             rows = (await session.execute(stmt.limit(limit))).scalars().all()
         return {"runs": [agent_run_out(row, []) for row in rows]}
 

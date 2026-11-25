@@ -306,6 +306,50 @@ async def _close_task_if_idle(
         task.updated_at = utcnow_iso()
 
 
+# A client that exits without run_end leaves a "running" row forever. The
+# console then shows ghost "进行中" runs. Stale rows are re-labelled
+# abandoned — never deleted: the call trace is still evidence of what the
+# agent did.
+ABANDONED_STATUS = "abandoned"
+_PRUNE_INTERVAL_SECONDS = 300
+_last_prune = 0.0
+
+
+async def prune_stale_runs(db: AsyncSession, *, now: datetime | None = None) -> int:
+    """Mark timed-out MCP runs ``abandoned``; returns how many changed."""
+    moment = now or datetime.now(timezone.utc)
+    cutoff = (moment - timedelta(seconds=SESSION_IDLE_SECONDS)).isoformat()
+    activity = func.coalesce(
+        AgentRun.last_seen_at, AgentRun.started_at, AgentRun.created_at
+    )
+    result = await db.execute(
+        update(AgentRun)
+        .where(
+            AgentRun.source == "mcp",
+            AgentRun.status == "running",
+            activity < cutoff,
+        )
+        .values(
+            status=ABANDONED_STATUS,
+            finished_at=moment.isoformat(),
+            error="client vanished",
+        )
+    )
+    return result.rowcount or 0
+
+
+async def maybe_prune_stale_runs(db: AsyncSession) -> int:
+    """Run the TTL sweep at most once per process every few minutes."""
+    global _last_prune
+    import time
+
+    now = time.monotonic()
+    if now - _last_prune < _PRUNE_INTERVAL_SECONDS:
+        return 0
+    _last_prune = now
+    return await prune_stale_runs(db)
+
+
 async def session_task_id(
     db: AsyncSession,
     *,
@@ -346,6 +390,7 @@ async def ensure_run(
         return None
     async with _STEP_LOCK:
         async with _db(settings) as db:
+            await maybe_prune_stale_runs(db)
             run = await active_run(db, session_id)
             if run is None:
                 run = await _open_auto_run(
@@ -459,6 +504,7 @@ async def start_run(
     task title on the 任务 page.
     """
     reset_session(session_id)
+    await maybe_prune_stale_runs(db)
     await _close_active(db, session_id, "客户端开始了新的 run")
     now = utcnow_iso()
     full_question = (question or "").strip()[:MAX_QUESTION_CHARS] or "MCP 会话"
@@ -495,11 +541,32 @@ async def finish_run(
     status: str = "done",
     answer: str | None = None,
     error: str | None = None,
+    run_id: str | None = None,
 ) -> AgentRun | None:
-    reset_session(session_id)
-    run = await active_run(db, session_id)
+    """Close a run by id, or the one this connection still owns.
+
+    A client that opens one connection per tool call (DSH, Claude Code)
+    cannot rely on the connection to identify the run it started: by the
+    time it calls ``run_end`` the session id is different. ``run_id`` is the
+    handle ``run_start`` returned; the connection remains the fallback for
+    clients that do keep a long-lived connection.
+    """
+    run: AgentRun | None = None
+    if run_id:
+        candidate = await db.get(AgentRun, run_id)
+        if candidate is not None and candidate.source == "mcp":
+            if candidate.status == "running":
+                run = candidate
+            elif candidate.status in ("done", "failed"):
+                # Idempotent: retrying run_end after a lost response must
+                # not report the run as missing.
+                return candidate
+    if run is None:
+        run = await active_run(db, session_id)
     if run is None:
         return None
+    if run.session_id == session_id:
+        reset_session(session_id)
     now = utcnow_iso()
     if status == "failed":
         run.status = "failed"
@@ -524,7 +591,7 @@ async def finish_run(
                         kind="note",
                         task_id=run.task_id,
                         actor_agent=run.client or "external",
-                        session_id=session_id,
+                        session_id=run.session_id,
                         content=answer,
                     )
                 )
@@ -556,6 +623,7 @@ async def record_call(
         return None
     async with _STEP_LOCK:
         async with _db(settings) as db:
+            await maybe_prune_stale_runs(db)
             run = await active_run(db, session_id)
             if run is None:
                 run = await _open_auto_run(
