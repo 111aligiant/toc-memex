@@ -34,3 +34,6 @@ docs/
 
 # DeepSeek-Harness 本机插件配置（含绝对路径），不发布
 .dsh-bundles/
+
+# WorkBuddy 本地工作区记忆，不发布
+.workbuddy/
