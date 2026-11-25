@@ -37,6 +37,12 @@ Toc Memex 把本地 PDF、扫描件、Word 与 Markdown 编成一个可核对的
 
 `activity`、`agent_notes`、`errata`、`usage_log`、`tasks` 以 `doc_id / node_id / page` 为锚点，不绑定会话。勘误生命周期是 `proposed → confirmed / rejected`，确认需要第二个 agent 独立复核，修正不覆盖旧记录而是追加新行。`task_timeline` 把同一任务的读写、批注与勘误合成一条时间线；`add_note` 与 `activity_write` 写入的交接和勘误会出现在下一次会话的检索与阅读结果里。未经 `confirmed` 的勘误不进入检索返回，`used / unused` 由 `mark_used` 单独记录。
 
+手记页是记录层的公共入口：按类型分组（笔记 / 踩坑 / 交接 / 入库备注），回复嵌套在原手记下方，刷新与下一次会话都能读到。
+
+![手记演示：设置身份 → 回复交接手记 → 嵌套展示](assets/notes-flow.gif)
+
+[查看 MP4 高清版](assets/notes-flow.mp4)。同样为 0.8× 放映、110% 页面缩放，底部字幕逐步讲解。
+
 ## 快速开始
 
 安装后提供三个入口：`toc-memex`（CLI）、`toc-memex-mcp`（MCP）、`toc-memex-web`（Web，前端产物随包分发）。
@@ -58,9 +64,23 @@ uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
 
 `pip` 卡在无进度（部分 IPv6 网络）时换镜像：`--index-url https://pypi.tuna.tsinghua.edu.cn/simple`。
 
-## MCP 接入
+### 入库演示
 
-把 `toc-memex-mcp` 接进 Claude Code / Cursor。默认工具面 8 个：`memex_overview` · `search` · `get_toc` · `read_section` · `add_note` · `mark_used` · `activity_write` · `propose_ops`；`TOCMEMEX_TOOLS=full` 展开治理、档案与页面级工具。
+Web 端上传同样可用：选文件、填入库备注，解析队列分阶段推进（抽取 → 目录重建 → 切片 → 索引），完成后文档带着页数与覆盖率出现在知识库。文本层 PDF 全程不调外部 API，扫描件才需要 OCR Key。
+
+![入库演示：上传对话框 → 解析队列分阶段推进 → 新文档就绪](assets/ingest-flow.gif)
+
+[查看 MP4 高清版](assets/ingest-flow.mp4)。演示上传的是公开论文 DDPM（arXiv:2006.11239）；解析队列等待段以 6× 快进，整体 0.8× 放映、110% 页面缩放，底部字幕逐步讲解。
+
+## 外部 agent 接入
+
+Toc Memex 不替 agent 做判断，只提供带地址的工具面。外部 agent 经 MCP 连入后，握手时自报的 `client_info.name` 记为作者，服务端为连接分配 `session_id`，每次调用落一条 `tool_call` / `tool_result`。对一次调用一条连接的客户端（DSH、WorkBuddy 常见），同一客户端 30 分钟内的调用归并为一个「外部 agent 会话」任务，调用不会散成断线记录；`run_start` / `run_end` 可显式划界。
+
+![WorkBuddy 与 DSH 经 MCP 接入，调用归档为任务时间线并可在测试台回放](assets/agent-flow.svg)
+
+### WorkBuddy
+
+`~/.workbuddy/mcp.json`：
 
 ```json
 {
@@ -73,7 +93,63 @@ uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
 }
 ```
 
-其余配置见 [`.env.example`](.env.example)。
+默认 `stdio`；客户端只支持 HTTP 时改用 `--transport streamable-http`（端口 8790）。默认工具面 8 个：`memex_overview` · `search` · `get_toc` · `read_section` · `add_note` · `mark_used` · `activity_write` · `propose_ops`；`TOCMEMEX_TOOLS=full` 展开治理、档案与页面级工具。其余配置见 [`.env.example`](.env.example)。
+
+### DSH
+
+在 profile 中插入一条 MCP server（`cordis.patch.yml`），同样以 stdio 直连本地 SQLite：
+
+```yaml
+- insert:
+    - id: mcp-toc-memex
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: toc-memex
+        transport: stdio
+        command: '<repo>/.venv/Scripts/python.exe'
+        args: ['-m', 'app.mcp_server']
+        cwd: '<repo>'
+        env:
+          TOCMEMEX_DB_PATH: '<repo>/data/tocmemex.db'
+          TOCMEMEX_DATA_DIR: '<repo>/data'
+```
+
+`<repo>` 换成仓库绝对路径。多个客户端各起一个进程、连同一个数据库文件，读写记录都落在同一处。
+
+### 一次典型调用
+
+以公开论文 [Attention Is All You Need](https://arxiv.org/abs/1706.03762) 为例，WorkBuddy 与 DSH 可以共用同一份本地馆藏，各自留下可回放的调用与手记：
+
+```text
+WorkBuddy
+  memex_overview                       → 馆藏与文档计数
+  search("scaled dot-product attention")
+                                      → 章节路径、node_id、PDF 第 4 页
+  read_section(doc_id, node_id)       → 原文切片与 citation_confidence
+  mark_used(chunk_id)                 → 标记实际采用的证据
+  add_note(kind="handoff")            → 给下一次会话留下交接
+
+DSH
+  search("positional encoding")        → 定位同名论文章节
+  read_section(doc_id, node_id)       → 读取位置编码原文
+  add_note(kind="note")               → 手记挂到 doc_id / node_id / page
+```
+
+上面 WorkBuddy 读到的 `Scaled Dot-Product Attention` 对应 PDF 物理页 4、论文印刷页 3。下一次会话仍可按同一节点继续阅读；任务页把两个客户端的调用、阅读和手记分别聚成时间线。
+
+### 动态可视化
+
+Web 的「任务」页把外部会话展开成活动时间线（读过哪一节、留下了什么），「测试台」页按 700ms 轮询回放每一步：调用参数、命中章节、引用与手记。两处都读持久化的 `AgentRun` / `AgentStep`，刷新后仍可回放；外部会话归档在任务页，不出现在测试台历史里。
+
+| 任务 · 外部会话时间线 | 测试台 · 步骤回放 |
+|---|---|
+| ![任务时间线：阅读记录与章节锚点](assets/agent-tasks.png) | ![步骤回放：search 调用与检索命中](assets/agent-replay.png) |
+
+![外部会话动态回放：展开任务时间线，逐步回放 search / read_section，最后留下手记](assets/agent-session.gif)
+
+[查看 MP4 高清版](assets/agent-session.mp4)。动图为 20 fps、110% 页面缩放，保留鼠标移动与点击反馈，底部字幕逐步讲解：任务页展开会话时间线 → 回放 `search` 与 `read_section` → 核对章节与页码 → `add_note` 留下手记。
+
+演示库只含公开论文 [Attention Is All You Need](https://arxiv.org/abs/1706.03762)、[BERT](https://arxiv.org/abs/1810.04805) 与 [DDPM](https://arxiv.org/abs/2006.11239)，不包含私人馆藏。画面中的 WorkBuddy 与 DSH 记录由 [`scripts/demo_ai_agents.py`](scripts/demo_ai_agents.py) 经 MCP 实际调用生成；入库与手记两条演示的录制见 [`scripts/shoot_flows.py`](scripts/shoot_flows.py)，手记内容由 [`scripts/demo_notes.py`](scripts/demo_notes.py) 写入（页码取自演示库目录）。
 
 ## Web 界面
 
