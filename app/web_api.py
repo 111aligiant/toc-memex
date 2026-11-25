@@ -24,13 +24,15 @@ import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
-from contextlib import closing
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, closing
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
 
 import sqlalchemy
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -850,8 +852,51 @@ def default_web_dir() -> Path | None:
     return None
 
 
+def _app_engine(app: FastAPI) -> AsyncEngine:
+    """Lazily create and cache the async engine on ``app.state``."""
+    if app.state.search_engine is None:
+        app.state.search_engine = make_engine(app.state.db_path)
+    return app.state.search_engine
+
+
+async def _ensure_schema(app: FastAPI) -> None:
+    """Create any tables/columns the running database is missing."""
+    from .db import ensure_schema
+
+    await ensure_schema(_app_engine(app))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Bring an existing database up to date before the first request.
+
+    Lifespan rather than the deprecated ``on_event("startup")``: Starlette
+    dropped on_startup in 1.0 and FastAPI only keeps it alive through a
+    compatibility shim, so a future release may remove it — and a lifecycle
+    that registers ``lifespan=`` would silently skip an ``on_event`` hook.
+    """
+    await _ensure_schema(app)
+    # Legacy external MCP runs predate activity-layer tasks; file them once
+    # so the 任务 page is not empty for work already done.
+    from .agent.external import backfill_external_tasks
+
+    try:
+        await backfill_external_tasks(_app_engine(app))
+    except Exception:
+        pass  # a migration must never keep the console from starting
+    from .ingest.bench import fail_stale_processing_scenarios
+
+    await fail_stale_processing_scenarios(session_factory(_app_engine(app)))
+    yield
+
+
 def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None = None) -> FastAPI:
-    app = FastAPI(title="Toc Memex API", docs_url=None, redoc_url=None)
+    app = FastAPI(
+        title="Toc Memex API",
+        docs_url=None,
+        redoc_url=None,
+        lifespan=_lifespan,
+    )
     app.add_middleware(_HostOriginGuardMiddleware)
     app.state.db_path = db_path
     app.state.data_dir = data_dir or db_path.parent
@@ -871,30 +916,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     app.state.run_tasks = set()
 
     def engine():
-        if app.state.search_engine is None:
-            app.state.search_engine = make_engine(db_path)
-        return app.state.search_engine
-
-    async def ensure_schema():
-        """Create any tables/columns the running database is missing."""
-        from .db import ensure_schema
-
-        await ensure_schema(engine())
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        await ensure_schema()
-        # Legacy external MCP runs predate activity-layer tasks; file them
-        # once so the 任务 page is not empty for work already done.
-        from .agent.external import backfill_external_tasks
-
-        try:
-            await backfill_external_tasks(engine())
-        except Exception:
-            pass  # a migration must never keep the console from starting
-        from .ingest.bench import fail_stale_processing_scenarios
-
-        await fail_stale_processing_scenarios(session_factory(engine()))
+        return _app_engine(app)
 
     @app.get("/api/namespaces")
     def api_namespaces() -> dict:
