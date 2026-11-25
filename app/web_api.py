@@ -2286,6 +2286,11 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
             "issueId": row.issue_id,
             "sessionId": row.session_id,
             "replyTo": row.reply_to,
+            "currentRev": row.current_rev or 1,
+            "revisedAt": row.revised_at,
+            "revisedBy": row.revised_by,
+            "retractedAt": row.retracted_at,
+            "retractedReason": row.retracted_reason,
             "createdAt": row.created_at,
         }
 
@@ -2339,6 +2344,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         author: str | None = None,
         kind: str | None = None,
         issue_id: str | None = None,
+        include_retracted: bool = False,
         limit: int = Query(default=50, le=200),
     ) -> dict:
         async with session_factory(engine())() as session:
@@ -2355,8 +2361,69 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 stmt = stmt.where(AgentNote.kind == kind)
             if issue_id:
                 stmt = stmt.where(AgentNote.issue_id == issue_id)
+            if not include_retracted:
+                stmt = stmt.where(AgentNote.retracted_at.is_(None))
             rows = (await session.execute(stmt)).scalars().all()
         return {"notes": [_note_out(row) for row in rows]}
+
+    @app.get("/api/notes/{note_id}/history")
+    async def api_note_history(note_id: int) -> dict:
+        """Every version of a note (rev 1 through current)."""
+        from .index import activity as activity_mod
+
+        async with session_factory(engine())() as session:
+            result = await activity_mod.note_history(session, note_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="note not found")
+        return result
+
+    class NoteUpdateIn(BaseModel):
+        body: str
+        reason: str = ""
+        author: str = "human"
+
+    class NoteRetractIn(BaseModel):
+        reason: str = ""
+        author: str = "human"
+
+    @app.put("/api/notes/{note_id}")
+    async def api_note_update(note_id: int, note: NoteUpdateIn) -> dict:
+        """Append a revision (old body kept in the chain)."""
+        from .index import activity as activity_mod
+
+        async with session_factory(engine())() as session:
+            try:
+                row = await activity_mod.note_update(
+                    session,
+                    note_id,
+                    note.body,
+                    author=note.author or "human",
+                    reason=note.reason or None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            await session.commit()
+            await session.refresh(row)
+            return _note_out(row)
+
+    @app.post("/api/notes/{note_id}/retract")
+    async def api_note_retract(note_id: int, note: NoteRetractIn) -> dict:
+        """Hide a note from the default list without deleting its history."""
+        from .index import activity as activity_mod
+
+        async with session_factory(engine())() as session:
+            try:
+                row = await activity_mod.note_retract(
+                    session,
+                    note_id,
+                    author=note.author or "human",
+                    reason=note.reason or None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            await session.commit()
+            await session.refresh(row)
+            return _note_out(row)
 
     @app.delete("/api/notes/{note_id}")
     async def api_note_delete(note_id: int) -> dict:

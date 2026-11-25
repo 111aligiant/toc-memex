@@ -174,3 +174,45 @@ async def test_note_body_cannot_be_cited_as_evidence(tmp_path, monkeypatch):
     run = await execute_with_fake_llm(db_path, monkeypatch, replies)
     assert run.status == "done", run.error
     assert json.loads(run.citations_json) == []
+
+
+async def test_note_update_keeps_a_revision_chain(tmp_path):
+    from app.db import init_db
+    from app.index import activity
+
+    engine = make_engine(tmp_path / "notes.db")
+    await init_db(engine)
+    async with session_factory(engine)() as db:
+        note = AgentNote(author="claude-code", kind="note", body="企业级知识库")
+        db.add(note)
+        await db.commit()
+        await db.refresh(note)
+
+        revised = await activity.note_update(
+            db,
+            note.id,
+            "政企知识库",
+            author="codex",
+            reason="措辞校准",
+        )
+        await db.commit()
+        assert revised.current_rev == 2
+        assert revised.body == "政企知识库"
+
+        history = await activity.note_history(db, note.id)
+        assert [item["rev"] for item in history["revisions"]] == [1, 2]
+        assert history["revisions"][0]["body"] == "企业级知识库"
+        assert history["revisions"][1]["reason"] == "措辞校准"
+        assert history["revisions"][1]["author"] == "codex"
+
+        await activity.note_retract(db, note.id, author="codex", reason="整条作废")
+        await db.commit()
+
+        visible = await activity.notes_list(db)
+        assert visible == []
+        archived = await activity.notes_list(db, include_retracted=True)
+        assert [row.id for row in archived] == [note.id]
+        # Nothing deleted: the chain is still readable.
+        still = await activity.note_history(db, note.id)
+        assert len(still["revisions"]) == 2
+    await engine.dispose()

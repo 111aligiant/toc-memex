@@ -1209,6 +1209,7 @@ async def list_notes(
     task_id: str = "",
     author: str = "",
     kind: str = "",
+    include_retracted: bool = False,
     limit: int = 50,
 ) -> list[dict]:
     """Read hand-off notes, newest first. Check notes before redoing work
@@ -1220,6 +1221,10 @@ async def list_notes(
 
     Pass ``task_id`` to read exactly the notes handed over for one task —
     the same task whose reads, cites and errata ``activity_list`` shows.
+
+    A note corrected with note_update shows its current body and
+    ``current_rev`` (e.g. 2); ``get_note_history`` returns the earlier
+    versions. Retracted notes are hidden unless ``include_retracted=true``.
     """
     async with _session() as db:
         rows = await _activity.notes_list(
@@ -1229,6 +1234,7 @@ async def list_notes(
             author=author or None,
             kind=kind or None,
             limit=limit,
+            include_retracted=include_retracted,
         )
         return [_activity.note_out(row) for row in rows]
 
@@ -1283,6 +1289,82 @@ async def delete_note(
         )
         await db.commit()
         return {"deleted": result.rowcount}
+
+
+@tool(profile=PROFILE_FULL)
+@observed
+async def note_update(
+    note_id: int,
+    body: str,
+    reason: str = "",
+    author: str = "",
+    ctx: Context | None = None,
+) -> dict:
+    """Correct a hand-off note by appending a revision.
+
+    The old body is kept in the revision chain — this is an erratum-style
+    correction, not an overwrite. ``reason`` says why (e.g. "措辞校准").
+    Any agent may correct a note: attribution and reason are recorded, and
+    nothing is lost, so the one-call-one-connection identity problem does
+    not make corrections impossible. 入库备注 is human-owned and refused.
+    Read the chain with get_note_history(note_id).
+    """
+    text = (body or "").strip()
+    if not text:
+        raise ToolError("body 不能为空")
+    who = author.strip() or _client_name(ctx) or "anonymous"
+    async with _session() as db:
+        try:
+            row = await _activity.note_update(
+                db, note_id, text, author=who, reason=reason or None
+            )
+        except ValueError as exc:
+            raise _tool_error(exc) from exc
+        await db.commit()
+        await db.refresh(row)
+        return _activity.note_out(row)
+
+
+@tool(profile=PROFILE_FULL)
+@observed
+async def note_retract(
+    note_id: int,
+    reason: str = "",
+    author: str = "",
+    ctx: Context | None = None,
+) -> dict:
+    """Retract a note (hidden from the default list, history kept).
+
+    Use it when the note is wrong as a whole rather than needing a
+    correction — note_update is the better tool for a fixable mistake.
+    Nothing is deleted: list_notes(include_retracted=true) and
+    get_note_history still show it. 入库备注 is human-owned and refused.
+    """
+    who = author.strip() or _client_name(ctx) or "anonymous"
+    async with _session() as db:
+        try:
+            row = await _activity.note_retract(
+                db, note_id, author=who, reason=reason or None
+            )
+        except ValueError as exc:
+            raise _tool_error(exc) from exc
+        await db.commit()
+        await db.refresh(row)
+        return _activity.note_out(row)
+
+
+@tool(profile=PROFILE_FULL)
+async def get_note_history(note_id: int) -> dict:
+    """Every version of a note: rev 1 (original) through the current one.
+
+    Each revision carries body, author, reason and created_at. Use it when
+    a note says it was corrected and you need to know what changed.
+    """
+    async with _session() as db:
+        result = await _activity.note_history(db, note_id)
+    if result is None:
+        raise ToolError(f"note not found: {note_id}")
+    return result
 
 
 # ── activity layer: tasks + append-only activity log ──────────────────

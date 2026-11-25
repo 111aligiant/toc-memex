@@ -458,3 +458,26 @@ export function fetchRuns(limit = 20, source = '') {
 export function fetchRun(id) {
   return request(`/api/runs/${encodeURIComponent(id)}`)
 }
+
+/** Every version of a note: rev 1 (original) through the current one. */
+export function fetchNoteHistory(noteId) {
+  return request(`/api/notes/${encodeURIComponent(noteId)}/history`)
+}
+
+/** Append a revision to a note (the previous body stays in the chain). */
+export function reviseNote(noteId, payload) {
+  return request(`/api/notes/${encodeURIComponent(noteId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** Hide a note from the default list without deleting its history. */
+export function retractNote(noteId, payload = {}) {
+  return request(`/api/notes/${encodeURIComponent(noteId)}/retract`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}

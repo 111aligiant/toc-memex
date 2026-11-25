@@ -133,6 +133,14 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
                     "ON agent_notes (task_id)"
                 )
             )
+        # Append-only revision chain (see AgentNote / NoteRevision).
+        await _add_column_if_missing(
+            conn, "agent_notes", "current_rev", "INTEGER NOT NULL DEFAULT 1"
+        )
+        await _add_column_if_missing(conn, "agent_notes", "revised_at", "VARCHAR(40)")
+        await _add_column_if_missing(conn, "agent_notes", "revised_by", "VARCHAR(80)")
+        await _add_column_if_missing(conn, "agent_notes", "retracted_at", "VARCHAR(40)")
+        await _add_column_if_missing(conn, "agent_notes", "retracted_reason", "TEXT")
 
     # ingest_runs: structural quality evidence. bookmark_count is what the
     # parser offered the TOC builder; garbled_pages is the JSON list of pages

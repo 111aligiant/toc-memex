@@ -1485,3 +1485,40 @@ async def test_stale_runs_are_marked_abandoned_not_deleted(tmp_path):
         assert stale.error == "client vanished"
         assert stale.finished_at
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_note_update_appends_a_revision_from_another_connection(
+    tmp_path, monkeypatch
+):
+    db_path = await seed(tmp_path)
+    _patch_mcp_session(monkeypatch, db_path, session_id="conn-a")
+    from app import mcp_server
+
+    added = await mcp_server.server.call_tool(
+        "add_note", {"body": "企业级知识库", "author": "claude-code"}
+    )
+    assert added.is_error is False
+
+    engine = make_engine(db_path)
+    async with session_factory(engine)() as db:
+        note = (await db.execute(select(AgentNote))).scalars().one()
+        note_id = note.id
+
+    monkeypatch.setattr(mcp_server, "_session_id", lambda ctx: "conn-b")
+    updated = await mcp_server.server.call_tool(
+        "note_update",
+        {"note_id": note_id, "body": "政企知识库", "reason": "措辞校准"},
+    )
+    assert updated.is_error is False
+
+    history = await mcp_server.server.call_tool(
+        "get_note_history", {"note_id": note_id}
+    )
+    assert history.is_error is False
+
+    async with session_factory(engine)() as db:
+        note = await db.get(AgentNote, note_id)
+        assert note.body == "政企知识库"
+        assert note.current_rev == 2
+    await engine.dispose()

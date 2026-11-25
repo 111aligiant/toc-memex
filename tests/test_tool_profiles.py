@@ -39,10 +39,10 @@ def clean_settings_cache():
     get_settings.cache_clear()
 
 
-async def test_full_profile_and_module_server_expose_all_40():
-    assert len(await _tool_names(PROFILE_FULL)) == 40
+async def test_full_profile_and_module_server_expose_all_43():
+    assert len(await _tool_names(PROFILE_FULL)) == 43
     # The console builds its schemas from this module-level instance.
-    assert len(await server.list_tools()) == 40
+    assert len(await server.list_tools()) == 43
 
 
 async def test_default_profile_is_exactly_eight_tools():
@@ -54,9 +54,9 @@ async def test_default_tools_are_a_subset_of_full():
     assert DEFAULT_TOOLS <= await _tool_names(PROFILE_FULL)
 
 
-def test_registry_profiles_hide_exactly_the_other_32():
+def test_registry_profiles_hide_exactly_the_other_35():
     by_profile = {name: profile for name, _, profile in _REGISTRY}
-    assert len(by_profile) == 40
+    assert len(by_profile) == 43
     assert {n for n, p in by_profile.items() if p == PROFILE_DEFAULT} == DEFAULT_TOOLS
     assert {
         n for n, p in by_profile.items() if p == PROFILE_FULL

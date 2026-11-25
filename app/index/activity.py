@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import ForeignKey, Integer, String, Text, select
+from sqlalchemy import ForeignKey, Integer, String, Text, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
-from ..models import AgentNote, Base, Chunk, Document, TocNode, utcnow_iso
+from ..models import AgentNote, Base, Chunk, Document, NoteRevision, TocNode, utcnow_iso
 
 ACTIVITY_KINDS = (
     "read",      # read_section auto-logged
@@ -352,7 +352,27 @@ def note_out(note: AgentNote) -> dict:
         "issue_id": note.issue_id,
         "session_id": note.session_id,
         "reply_to": note.reply_to,
+        "current_rev": getattr(note, "current_rev", None) or 1,
+        "revision_count": max(
+            getattr(note, "current_rev", None) or 1,
+            getattr(note, "revision_count", 0) or 0,
+        ),
+        "revised_at": getattr(note, "revised_at", None),
+        "revised_by": getattr(note, "revised_by", None),
+        "retracted_at": getattr(note, "retracted_at", None),
+        "retracted_reason": getattr(note, "retracted_reason", None),
         "created_at": note.created_at,
+    }
+
+
+def revision_out(revision: NoteRevision) -> dict:
+    return {
+        "note_id": revision.note_id,
+        "rev": revision.rev,
+        "body": revision.body,
+        "author": revision.author,
+        "reason": revision.reason,
+        "created_at": revision.created_at,
     }
 
 
@@ -363,12 +383,16 @@ async def notes_list(
     author: str | None = None,
     kind: str | None = None,
     limit: int = 50,
+    include_retracted: bool = False,
 ) -> list[AgentNote]:
     """Hand-off notes, newest first, filterable by the work unit they belong to.
 
     ``task_id`` is the filter agents actually need ("what did the previous
     agent hand over on this task"). Without it the only way to find a
     hand-off was to scan every note in the library.
+
+    Retracted notes are hidden by default (the correction should be what
+    the next agent reads); ``include_retracted=True`` shows the record.
     """
     stmt = select(AgentNote).order_by(AgentNote.id.desc())
     if doc_id:
@@ -379,8 +403,143 @@ async def notes_list(
         stmt = stmt.where(AgentNote.author == author)
     if kind:
         stmt = stmt.where(AgentNote.kind == kind)
+    if not include_retracted:
+        stmt = stmt.where(AgentNote.retracted_at.is_(None))
     stmt = stmt.limit(max(1, min(limit, 200)))
-    return list((await db.execute(stmt)).scalars().all())
+    rows = list((await db.execute(stmt)).scalars().all())
+    if rows:
+        counts = dict(
+            (
+                await db.execute(
+                    select(NoteRevision.note_id, func.count())
+                    .where(NoteRevision.note_id.in_([row.id for row in rows]))
+                    .group_by(NoteRevision.note_id)
+                )
+            ).all()
+        )
+        for row in rows:
+            row.revision_count = counts.get(row.id, 0)
+    return rows
+
+
+async def note_history(db: AsyncSession, note_id: int) -> dict | None:
+    """One note's full revision chain plus its current state."""
+    note = await db.get(AgentNote, note_id)
+    if note is None:
+        return None
+    rows = list(
+        (
+            await db.execute(
+                select(NoteRevision)
+                .where(NoteRevision.note_id == note_id)
+                .order_by(NoteRevision.rev)
+            )
+        ).scalars().all()
+    )
+    if not rows:
+        # Legacy note from before the chain existed: its current body is the
+        # first version. Synthesize it instead of writing on a read.
+        rows = [
+            NoteRevision(
+                note_id=note.id,
+                rev=1,
+                body=note.body,
+                author=note.author,
+                reason=None,
+                created_at=note.created_at,
+            )
+        ]
+    return {
+        "note": note_out(note),
+        "revisions": [revision_out(row) for row in rows],
+    }
+
+
+async def note_update(
+    db: AsyncSession,
+    note_id: int,
+    body: str,
+    *,
+    author: str,
+    reason: str | None = None,
+) -> AgentNote:
+    """Append a new revision; the previous body stays in the chain.
+
+    Any agent may correct a note — attribution and reason are recorded, and
+    nothing is lost. (Deleting keeps the strict same-session ownership
+    rule; correcting does not, because a one-call-one-connection client
+    could never correct the note it wrote.)
+    """
+    note = await db.get(AgentNote, note_id)
+    if note is None:
+        raise ValueError(f"note not found: {note_id}")
+    if note.kind == INGEST_NOTE_KIND:
+        raise ValueError("入库备注由人类维护，agent 不能修改")
+    text = (body or "").strip()
+    if not text:
+        raise ValueError("body 不能为空")
+    now = utcnow_iso()
+    previous = list(
+        (
+            await db.execute(
+                select(NoteRevision)
+                .where(NoteRevision.note_id == note_id)
+                .order_by(NoteRevision.rev)
+            )
+        ).scalars().all()
+    )
+    if not previous:
+        db.add(
+            NoteRevision(
+                note_id=note.id,
+                rev=1,
+                body=note.body,
+                author=note.author,
+                reason=None,
+                created_at=note.created_at,
+            )
+        )
+        last_rev = 1
+    else:
+        last_rev = previous[-1].rev
+    rev = max(last_rev, note.current_rev or 1) + 1
+    db.add(
+        NoteRevision(
+            note_id=note.id,
+            rev=rev,
+            body=text,
+            author=author or "anonymous",
+            reason=(reason or "").strip() or None,
+            created_at=now,
+        )
+    )
+    note.body = text
+    note.current_rev = rev
+    note.revised_at = now
+    note.revised_by = author or "anonymous"
+    await db.flush()
+    return note
+
+
+async def note_retract(
+    db: AsyncSession,
+    note_id: int,
+    *,
+    author: str,
+    reason: str | None = None,
+) -> AgentNote:
+    """Hide a note from the default list without deleting its history."""
+    note = await db.get(AgentNote, note_id)
+    if note is None:
+        raise ValueError(f"note not found: {note_id}")
+    if note.kind == INGEST_NOTE_KIND:
+        raise ValueError("入库备注由人类维护，agent 不能撤回")
+    if note.retracted_at is None:
+        note.retracted_at = utcnow_iso()
+        note.retracted_reason = (reason or "").strip() or None
+        note.revised_by = author or note.revised_by
+    await db.flush()
+    return note
 
 
 async def ingest_note(db: AsyncSession, doc_id: str) -> AgentNote | None:

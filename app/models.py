@@ -377,7 +377,44 @@ class AgentNote(Base):
     # Neither proves which model wrote the note — see docs/agent-identity.md.
     session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     reply_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Notes are append-only history, like document errata: a correction is a
+    # new revision, never an overwrite. ``body`` always holds the current
+    # version; ``current_rev`` says which one it is. Retraction is soft
+    # (hidden from the default list), so the record survives.
+    current_rev: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    revised_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    revised_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    retracted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    retracted_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)
+
+
+class NoteRevision(Base):
+    """Every version of a hand-off note, newest last.
+
+    Rev 1 is the original body. ``note_update`` appends a row and bumps
+    ``AgentNote.current_rev``; nothing is ever deleted, so a reader can see
+    what was corrected and why. Rev 1 may be materialised lazily from the
+    note's own body for rows written before this table existed.
+    """
+
+    __tablename__ = "note_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    note_id: Mapped[int] = mapped_column(
+        ForeignKey("agent_notes.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    rev: Mapped[int] = mapped_column(Integer, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    author: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "rev", name="uq_note_revision_rev"),
+    )
 
 
 class DocBaseline(Base):
