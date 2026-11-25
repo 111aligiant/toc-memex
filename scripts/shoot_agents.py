@@ -247,8 +247,9 @@ def main() -> int:
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
     ])
     palette = (
-        f"[0:v]crop=1280:800:0:0,setpts=PTS/{args.speed},fps=16,split[a][b];"
-        "[a]palettegen=max_colors=192:stats_mode=diff[p];"
+        f"[0:v]crop=1280:800:0:0,setpts=PTS/{args.speed},fps=12,"
+        "scale=960:-1:flags=lanczos,split[a][b];"
+        "[a]palettegen=max_colors=128:stats_mode=diff[p];"
         "[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
     )
     run([

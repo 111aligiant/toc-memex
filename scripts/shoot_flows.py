@@ -277,14 +277,15 @@ def export_video(source: Path, mp4: Path, gif: Path, speed: float,
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(mp4),
         ])
-    # GIF
+    # GIF（960 宽 / 12fps / 128 色，控制 README 体积）
     gif_tail = (
-        "split[a][b];[a]palettegen=max_colors=192:stats_mode=diff[p];"
+        "scale=960:-1:flags=lanczos,split[a][b];"
+        "[a]palettegen=max_colors=128:stats_mode=diff[p];"
         "[b][p]paletteuse=dither=sierra2_4a:diff_mode=rectangle"
     )
     run([
         ffmpeg, "-y", "-i", str(source), "-filter_complex",
-        chain(16, gif_tail),
+        chain(12, gif_tail),
         "-loop", "0", str(gif),
     ])
     with Image.open(gif) as image:

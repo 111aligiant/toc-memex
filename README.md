@@ -147,7 +147,7 @@ Web 的「任务」页把外部会话展开成活动时间线（读过哪一节�
 
 ![外部会话动态回放：展开任务时间线，逐步回放 search / read_section，最后留下手记](assets/agent-session.gif)
 
-[查看 MP4 高清版](assets/agent-session.mp4)。动图为 20 fps、110% 页面缩放，保留鼠标移动与点击反馈，底部字幕逐步讲解：任务页展开会话时间线 → 回放 `search` 与 `read_section` → 核对章节与页码 → `add_note` 留下手记。
+[查看 MP4 高清版](assets/agent-session.mp4)。动图 12 fps、110% 页面缩放，保留鼠标移动与点击反馈，底部字幕逐步讲解：任务页展开会话时间线 → 回放 `search` 与 `read_section` → 核对章节与页码 → `add_note` 留下手记。
 
 演示库只含公开论文 [Attention Is All You Need](https://arxiv.org/abs/1706.03762)、[BERT](https://arxiv.org/abs/1810.04805) 与 [DDPM](https://arxiv.org/abs/2006.11239)，不包含私人馆藏。画面中的 WorkBuddy 与 DSH 记录由 [`scripts/demo_ai_agents.py`](scripts/demo_ai_agents.py) 经 MCP 实际调用生成；入库与手记两条演示的录制见 [`scripts/shoot_flows.py`](scripts/shoot_flows.py)，手记内容由 [`scripts/demo_notes.py`](scripts/demo_notes.py) 写入（页码取自演示库目录）。
 
