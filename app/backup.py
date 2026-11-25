@@ -21,12 +21,9 @@ from pathlib import Path
 
 
 def _app_version() -> str:
-    try:
-        from importlib.metadata import version
+    from . import __version__
 
-        return version("toc-memex")
-    except Exception:
-        return "0.1.0"
+    return __version__
 
 
 def _rotate(backups_dir: Path, keep: int) -> None:

@@ -26,6 +26,7 @@ from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import __version__
 from .agent import external as _external
 from .agent.call_guard import REPLAY_NOTE, guard_for
 from .agent.instructions import FULL_INSTRUCTIONS, instructions_for
@@ -84,7 +85,7 @@ server = MCPServer(
     title="Toc Memex",
     description=SERVER_DESCRIPTION,
     instructions=FULL_INSTRUCTIONS,
-    version="0.1.0",
+    version=__version__,
 )
 
 
@@ -122,7 +123,7 @@ def build_server(profile: str) -> MCPServer:
         title="Toc Memex",
         description=SERVER_DESCRIPTION,
         instructions=instructions_for(profile),
-        version="0.1.0",
+        version=__version__,
     )
     for tool_name, fn, required in _REGISTRY:
         if profile == PROFILE_FULL or required == PROFILE_DEFAULT:
