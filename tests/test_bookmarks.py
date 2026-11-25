@@ -151,3 +151,35 @@ def test_unnumbered_title_repeated_on_two_pages_is_kept():
     ]
     result = filter_bookmarks(bookmarks)
     assert [bookmark.title for bookmark in result] == ["引言", "引 言", "1 范围"]
+
+
+def test_outline_keeps_prose_title_with_plus():
+    """`+` alone is prose, not a formula: ReAct's §2 title must survive."""
+    bookmarks = [
+        Bookmark(
+            1,
+            "2 ReAct: Synergizing Reasoning + Acting",
+            2,
+            from_outline=True,
+        ),
+        Bookmark(1, "3 Tasks", 3, from_outline=True),
+    ]
+    result = filter_bookmarks(bookmarks)
+    assert [bookmark.title for bookmark in result] == [
+        "2 ReAct: Synergizing Reasoning + Acting",
+        "3 Tasks",
+    ]
+
+
+def test_outline_keeps_english_terminal_sections():
+    bookmarks = [
+        Bookmark(1, "Conclusion", 9, from_outline=True),
+        Bookmark(1, "References", 10, from_outline=False),
+        Bookmark(1, "ACKNOWLEDGMENTS", 12, from_outline=False),
+    ]
+    result = filter_bookmarks(bookmarks)
+    assert [bookmark.title for bookmark in result] == [
+        "Conclusion",
+        "References",
+        "ACKNOWLEDGMENTS",
+    ]

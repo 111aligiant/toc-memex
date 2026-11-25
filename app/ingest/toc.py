@@ -281,6 +281,18 @@ def _from_bookmarks(
     nodes = _convert_page_tree(
         doc_id, roots, parsed.page_count, "bookmark", 1.0
     )
+    # An authored outline often titles entries without the number printed
+    # in the body ("Introduction" vs "1 Introduction"). The text layer
+    # recovered those numbers upstream (pipeline._enrich_outline); keep them
+    # on the node so section-number lookup and chunk matching can use them.
+    numbers = {
+        "".join((b.title or "").split()).lower(): b.heading_num
+        for b in source
+        if b.heading_num
+    }
+    for node in nodes:
+        if node.heading_num is None:
+            node.heading_num = numbers.get("".join(node.title.split()).lower())
     return _fix_page_ranges(nodes, parsed.page_count)
 
 

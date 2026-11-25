@@ -15,11 +15,24 @@ _PAGE_LABEL = re.compile(
     r"^(?:page|p\.?|seite|página|página|页|第)\s*[0-9０-９]+\s*页?$", re.IGNORECASE
 )
 
-# Sentence punctuation and math notation never appear in a real heading.
-# Outlines auto-built by authoring tools bookmark displayed equations and
-# body lines too ("2Al + N2 -> 2AlN (2-1)", "…，无定形"); a title carrying
-# any of these marks is one of them, not a section.
-_NON_HEADING_MARKS = tuple("。，：；＝→←＿＾+*\"“”‘’?!？!")
+# Sentence punctuation never appears in a real heading. Outlines
+# auto-built by authoring tools bookmark body lines too ("…，无定形");
+# a title carrying sentence punctuation is one of them, not a section.
+# Equation operators mark bookmarked display equations
+# ("2Al + N2 -> 2AlN (2-1)"). A "+" alone is legitimate prose
+# ("ReAct: Synergizing Reasoning + Acting"), so only operators that
+# actually signal a formula are rejected.
+_SENTENCE_MARKS = tuple("。，；：？！？!")
+_EQUATION_MARK = re.compile(r"->|<-|=>|=|→|←|≥|≤|＝|＿|＾")
+_QUOTE_MARKS = tuple("\"“”‘’")
+
+
+def _has_non_heading_marks(title: str) -> bool:
+    return (
+        any(mark in title for mark in _SENTENCE_MARKS)
+        or any(mark in title for mark in _QUOTE_MARKS)
+        or _EQUATION_MARK.search(title) is not None
+    )
 
 # Legitimate unnumbered sections worth keeping from a PDF outline.
 _KEEP_UNNUMBERED = {
@@ -31,8 +44,14 @@ _KEEP_UNNUMBERED = {
     "范围",
     "缩略语",
     "附录",
+    "references",
+    "bibliography",
+    "acknowledgements",
+    "acknowledgments",
 }
-_KEEP_UNNUMBERED_COMPACT = {"".join(title.split()) for title in _KEEP_UNNUMBERED}
+_KEEP_UNNUMBERED_COMPACT = {
+    "".join(title.split()).lower() for title in _KEEP_UNNUMBERED
+}
 
 
 _APPENDIX_SUBSECTION = re.compile(r"^([A-Z])\.\d+")
@@ -136,7 +155,7 @@ def filter_bookmarks(bookmarks: list[Bookmark]) -> list[Bookmark]:
             or _PAGE_FURNITURE.search(title)
             or is_bare_designation(title)
             or (bookmark.from_outline and _PAGE_LABEL.fullmatch(title))
-            or (bookmark.from_outline and any(mark in title for mark in _NON_HEADING_MARKS))
+            or (bookmark.from_outline and _has_non_heading_marks(title))
         ):
             continue
 
@@ -150,10 +169,15 @@ def filter_bookmarks(bookmarks: list[Bookmark]) -> list[Bookmark]:
             if num is None:
                 if bookmark.from_outline:
                     level = max(1, min(6, bookmark.level))
-                elif "".join(title.split()) not in _KEEP_UNNUMBERED_COMPACT:
+                elif "".join(title.split()).lower() not in _KEEP_UNNUMBERED_COMPACT:
                     continue
                 else:
                     level = 1
+        if num is None and bookmark.heading_num:
+            # Numbers recovered from the body text (see
+            # ``pipeline._number_outline_bookmarks``) survive this pass: the
+            # outline title itself often omits the number printed on the page.
+            num = bookmark.heading_num
 
         if bookmark.from_outline:
             # An authored outline lists each section once; a spaced variant

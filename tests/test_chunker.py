@@ -383,3 +383,88 @@ def test_chunks_split_long_text_with_overlap():
     chunks = chunk_document(parsed, toc, max_chars=100, overlap=20)
     assert len(chunks) >= 3
     assert all(len(c.content) <= 100 for c in chunks)
+
+
+def test_same_page_bookmarks_without_numbers_split_at_body_headings():
+    """An authored outline titles sections "Introduction" while the page
+    prints "1 Introduction"; several such sections share one page, so page
+    boundaries alone cannot split them."""
+    parsed = ParsedDocument(
+        pages=[
+            OcrPage(
+                0,
+                100,
+                200,
+                "",
+                [
+                    heading("1 Introduction", 10, 1),
+                    body("intro text", 20, 2),
+                    heading("2 Background", 30, 3),
+                    body("background text", 40, 4),
+                    heading("3 Model Architecture", 50, 5),
+                    body("model text", 60, 6),
+                ],
+                {},
+                {},
+            )
+        ],
+        bookmarks=[],
+        metadata={},
+    )
+    toc = [
+        node("d:intro", None, 1, None, "Introduction", 0, 0),
+        node("d:bg", None, 1, None, "Background", 0, 0),
+        node("d:model", None, 1, None, "Model Architecture", 0, 0),
+    ]
+    chunks = chunk_document(parsed, toc, max_chars=500, overlap=0)
+    assert [chunk.node_id for chunk in chunks] == [
+        "d:intro",
+        "d:bg",
+        "d:model",
+    ]
+    assert "background text" in chunks[1].content
+    assert "model text" in chunks[2].content
+
+
+def test_section_tail_on_next_page_stays_with_previous_node():
+    """Text above the heading that opens a new page belongs to the section
+    carried over from the previous page, not to the new section."""
+    parsed = ParsedDocument(
+        pages=[
+            OcrPage(
+                0,
+                100,
+                200,
+                "",
+                [
+                    heading("1 甲", 10, 1),
+                    body("甲正文", 20, 2),
+                ],
+                {},
+                {},
+            ),
+            OcrPage(
+                1,
+                100,
+                200,
+                "",
+                [
+                    body("甲在第二页的续文", 10, 1),
+                    heading("2 乙", 20, 2),
+                    body("乙正文", 30, 3),
+                ],
+                {},
+                {},
+            ),
+        ],
+        bookmarks=[],
+        metadata={},
+    )
+    toc = [
+        node("d:1", None, 1, "1", "1 甲", 0, 0),
+        node("d:2", None, 1, "2", "2 乙", 1, 1),
+    ]
+    chunks = chunk_document(parsed, toc, max_chars=500, overlap=0)
+    assert [chunk.node_id for chunk in chunks] == ["d:1", "d:2"]
+    assert "续文" in chunks[0].content
+    assert "续文" not in chunks[1].content

@@ -49,7 +49,15 @@ def _index_nodes(
     for index, node in enumerate(toc):
         if node.heading_num:
             by_num.setdefault(_canon_num(node.heading_num), []).append((index, node))
-        by_title.setdefault(_canon_title(node.title), []).append((index, node))
+        # Index both the stored title and its number-stripped form: an
+        # authored outline titles a section "Introduction" while the body
+        # line prints "1 Introduction" (and vice versa).
+        keys = {_canon_title(node.title)}
+        parsed = parse_heading(node.title)
+        if parsed is not None and parsed[1]:
+            keys.add(_canon_title(parsed[1]))
+        for key in keys:
+            by_title.setdefault(key, []).append((index, node))
     return by_num, by_title
 
 
@@ -115,10 +123,11 @@ def _match_heading(
         pool = by_num.get(_canon_num(num), [])
     if not pool:
         pool = by_title.get(full_key, [])
+    short = _canon_title(parsed[1]) if parsed else ""
+    if not pool and short:
+        pool = by_title.get(short, [])
     if not pool:
         return None
-
-    short = _canon_title(parsed[1]) if parsed else ""
 
     def score(item: tuple[int, TocNodeData]) -> tuple:
         _, node = item
@@ -317,12 +326,32 @@ def chunk_document(
             continue
 
         starting = _first_starting_node(toc, page.page_index)
+        # A page that opens with the new section's heading switches there,
+        # block by block. Switching at the page boundary instead would hand
+        # a section's tail (the lines above the next heading) to the next
+        # section. If the new section's heading is missing from the text
+        # (printed-TOC page mapping, OCR miss), keep the old page-boundary
+        # switch as the fallback.
+        starting_heading_on_page = False
+        if starting is not None:
+            for block in blocks:
+                if block.label not in _HEADING_LABELS:
+                    continue
+                matched = _match_heading(
+                    block.content, page.page_index, by_num, by_title
+                )
+                if matched is not None and (
+                    matched is starting
+                    or _is_descendant(matched, starting, by_id)
+                ):
+                    starting_heading_on_page = True
+                    break
         if starting is not None and (
             current_node is None
             or not _covers(current_node, page.page_index)
             or _is_descendant(starting, current_node, by_id)
         ):
-            if starting is not current_node:
+            if not starting_heading_on_page and starting is not current_node:
                 flush()
                 current_node = starting
         elif current_node is None or not _covers(current_node, page.page_index):

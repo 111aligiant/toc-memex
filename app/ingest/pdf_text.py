@@ -18,7 +18,21 @@ _SENTENCE_END = ("。", "；", "，", ".", ";")
 _PAGE_TOKEN = re.compile(
     r"^(?:\d+(?:[-－–—−]\d+)?|[A-Za-z][-－–—−]\d+|[ivxlcdmIVXLCDM]+)$"
 )
-_UNNUMBERED_TOP_LEVEL = {"前言", "引言", "参考文献", "索引", "缩略语", "目录"}
+_UNNUMBERED_TOP_LEVEL = {
+    "前言",
+    "引言",
+    "参考文献",
+    "索引",
+    "缩略语",
+    "目录",
+    # English papers: terminal sections carry no number, but they are real
+    # sections. Without them the last chapter's page range swallows the
+    # bibliography and its chunks.
+    "references",
+    "bibliography",
+    "acknowledgements",
+    "acknowledgments",
+}
 _MEANINGFUL_PUNCT = set(
     ".,;:!?()[]{}<>/\\-+=*%#@&'\"，。；：！？（）【】《》、—“”‘’…·－～"
 )
@@ -159,7 +173,7 @@ def _text_heading(text: str) -> tuple[str | None, str, int] | None:
         return None
     num, title, level = parsed
     if num is None:
-        if "".join(text.split()) not in _UNNUMBERED_TOP_LEVEL:
+        if "".join(text.split()).lower() not in _UNNUMBERED_TOP_LEVEL:
             return None
         return parsed
     if not title or len(title) < 2 or len(title) > 80:

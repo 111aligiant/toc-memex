@@ -148,6 +148,22 @@ def read_pdf_bookmarks(path: Path) -> list[Bookmark]:
     ]
 
 
+_TERMINAL_SECTIONS = {
+    "references",
+    "bibliography",
+    "acknowledgements",
+    "acknowledgments",
+}
+
+
+def _canon_bookmark_title(title: str | None) -> str:
+    from .heading import parse_heading
+
+    parsed = parse_heading(title or "")
+    text = parsed[1] if parsed else (title or "")
+    return "".join(text.split()).lower()
+
+
 def _prefer_outline_bookmarks(synth: list[Bookmark], path: Path) -> list[Bookmark]:
     """The authored PDF outline beats text-line heading heuristics.
 
@@ -157,6 +173,12 @@ def _prefer_outline_bookmarks(synth: list[Bookmark], path: Path) -> list[Bookmar
     entries, and either nested levels or a solid flat list). A PDF whose
     outline is junk or missing keeps the heuristic bookmarks — this is a
     per-document decision, not a format rule.
+
+    The outline often omits what the body text carries: section numbers
+    (arXiv outlines title entries "Introduction", the page prints
+    "1 Introduction") and terminal sections such as References. Both are
+    recovered from the heuristic bookmarks so the chunker can split a page
+    at "2 Background" and the last chapter cannot swallow the bibliography.
     """
     outline = read_pdf_bookmarks(path)
     if len(outline) < 2:
@@ -166,8 +188,67 @@ def _prefer_outline_bookmarks(synth: list[Bookmark], path: Path) -> list[Bookmar
     kept = filter_bookmarks(outline)
     levels = {bookmark.level for bookmark in kept}
     if len(kept) >= 3 and (len(levels) >= 2 or len(kept) >= 5):
-        return outline
+        return _enrich_outline(outline, synth)
     return synth
+
+
+def _enrich_outline(
+    outline: list[Bookmark], synth: list[Bookmark]
+) -> list[Bookmark]:
+    """Fill outline entries from the text layer: numbers and terminal sections."""
+    numbers: dict[str, str] = {}
+    terminal: list[Bookmark] = []
+    for bookmark in synth:
+        key = _canon_bookmark_title(bookmark.title)
+        if not key:
+            continue
+        if bookmark.heading_num and key not in numbers:
+            numbers[key] = bookmark.heading_num
+        if (
+            key in _TERMINAL_SECTIONS
+            and bookmark.heading_num is None
+            and all(key != _canon_bookmark_title(item.title) for item in terminal)
+        ):
+            terminal.append(bookmark)
+
+    enriched: list[Bookmark] = []
+    seen: set[str] = set()
+    changed = False
+    for bookmark in outline:
+        key = _canon_bookmark_title(bookmark.title)
+        seen.add(key)
+        heading_num = bookmark.heading_num or numbers.get(key)
+        if heading_num and heading_num != bookmark.heading_num:
+            changed = True
+            bookmark = Bookmark(
+                level=bookmark.level,
+                title=bookmark.title,
+                page_index=bookmark.page_index,
+                heading_num=heading_num,
+                from_outline=bookmark.from_outline,
+            )
+        enriched.append(bookmark)
+
+    for bookmark in terminal:
+        key = _canon_bookmark_title(bookmark.title)
+        if key in seen:
+            continue
+        changed = True
+        enriched.append(
+            Bookmark(
+                level=1,
+                title=bookmark.title,
+                page_index=bookmark.page_index,
+                heading_num=bookmark.heading_num,
+                from_outline=False,
+            )
+        )
+    if not changed:
+        return outline
+    # Page order is the reading order the outline already follows; a stable
+    # sort keeps same-page entries in outline order.
+    enriched.sort(key=lambda item: item.page_index)
+    return enriched
 
 
 def parse_markdown(path: Path) -> ParsedDocument:
