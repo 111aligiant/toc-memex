@@ -148,3 +148,94 @@ def test_ingest_path_normalizes_relative_path():
     assert "Path(path).resolve()" in src
     # The normalization happens before the DB row is written.
     assert src.index("Path(path).resolve()") < src.index("_open_ingest_row")
+
+async def _seed_nodes(tmp_path) -> tuple:
+    engine = make_engine(tmp_path / "nodes.db")
+    await init_db(engine)
+    Session = session_factory(engine)
+    async with Session() as db:
+        db.add(Namespace(id="shared", kind="shared"))
+        await db.flush()
+        doc = Document(
+            id="d1", namespace_id="shared", title="论文", filename="p.pdf",
+            file_path="p.pdf", content_hash="h", status="ready",
+        )
+        db.add(doc)
+        await db.flush()
+        db.add_all(
+            [
+                TocNode(
+                    doc_id="d1", node_id="n-method", parent_id=None, level=1,
+                    heading_num="3", title="3 Method",
+                    heading_path="3 Method", page_start=3, page_end=4,
+                    source="bookmark", confidence=1.0,
+                ),
+                TocNode(
+                    doc_id="d1", node_id="n-refs", parent_id=None, level=1,
+                    heading_num=None, title="References",
+                    heading_path="References", page_start=9, page_end=10,
+                    source="bookmark", confidence=1.0,
+                ),
+                TocNode(
+                    doc_id="d1", node_id="n-21", parent_id="n-method", level=2,
+                    heading_num="3.1", title="3.1 Models",
+                    heading_path="3 Method > 3.1 Models", page_start=3, page_end=4,
+                    source="bookmark", confidence=1.0,
+                ),
+            ]
+        )
+        await db.flush()
+        chunks = [
+            Chunk(doc_id="d1", node_id="n-method", chunk_index=0,
+                  content="retrieval augmented generation method body",
+                  heading_path="3 Method", page_start=3, page_end=3),
+            # The apparatus repeats the query many times and wins raw BM25.
+            Chunk(doc_id="d1", node_id="n-refs", chunk_index=1,
+                  content=("retrieval augmented generation " * 30),
+                  heading_path="References", page_start=9, page_end=9),
+            Chunk(doc_id="d1", node_id="n-21", chunk_index=2,
+                  content="models retrieval augmented generation encoder",
+                  heading_path="3 Method > 3.1 Models", page_start=4, page_end=4),
+            Chunk(doc_id="d1", node_id="n-21", chunk_index=3,
+                  content="retrieval augmented generation decoder",
+                  heading_path="3 Method > 3.1 Models", page_start=4, page_end=4),
+        ]
+        db.add_all(chunks)
+        await db.flush()
+        from app.index.fts import index_document
+        await index_document(db, doc, chunks)
+        await db.commit()
+    return engine, Session
+
+
+@pytest.mark.asyncio
+async def test_apparatus_hits_rank_below_body_sections(tmp_path):
+    engine, _ = await _seed_nodes(tmp_path)
+    async with session_factory(engine)() as db:
+        result = await scoped_search(
+            db, "retrieval augmented generation", top_k=4, distinct_docs=None
+        )
+    titles = [hit["title"] for hit in result["results"]]
+    assert titles[0] != "References"
+    assert "3 Method" in titles[0] or (titles[0] or "").startswith("3.")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_distinct_nodes_keeps_one_chunk_per_section(tmp_path):
+    engine, _ = await _seed_nodes(tmp_path)
+    async with session_factory(engine)() as db:
+        deduped = await scoped_search(
+            db, "retrieval augmented generation", top_k=8, distinct_docs=None
+        )
+        every = await scoped_search(
+            db,
+            "retrieval augmented generation",
+            top_k=8,
+            distinct_docs=None,
+            distinct_nodes=False,
+        )
+    keys = [(hit["doc_id"], hit["node_id"]) for hit in deduped["results"]]
+    assert len(keys) == len(set(keys))
+    assert len(every["results"]) > len(deduped["results"])
+    await engine.dispose()

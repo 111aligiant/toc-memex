@@ -740,6 +740,7 @@ async def search(
     mode: str = "auto",
     filters: dict | None = None,
     doc_ids: list[str] | None = None,
+    distinct_nodes: bool = True,
     actor_agent: str = "",
     task_id: str = "",
     ctx: Context | None = None,
@@ -753,7 +754,9 @@ async def search(
     ``page_start/page_end``, and the agent-facing ``pdf_page_start`` /
     ``pdf_page_end`` (1-based PDF pages). Cite ``pdf_page_*``, not
     ``page_start``. ``printed_page_*`` are null until printed labels are
-    stored.
+    stored. Results keep at most two hits per document and one hit per TOC
+    node; pass ``distinct_nodes=false`` to see every matching chunk of a
+    long section.
 
     ``mode`` is ``auto|lexical|semantic|hybrid``. Only lexical retrieval
     exists, so ``semantic`` / ``hybrid`` run lexical and say so with
@@ -793,6 +796,7 @@ async def search(
                     doc_ids=doc_ids,
                     filters=filters,
                     mode=mode_value,
+                    distinct_nodes=distinct_nodes,
                 )
             except _collections.CollectionNotFound as exc:
                 # The model often derives a collection name from a document
@@ -806,6 +810,7 @@ async def search(
                     doc_ids=doc_ids,
                     filters=filters,
                     mode=mode_value,
+                    distinct_nodes=distinct_nodes,
                 )
                 valid = "、".join(name for name, _count in exc.valid[:10]) or "（无）"
                 payload["collection_note"] = (

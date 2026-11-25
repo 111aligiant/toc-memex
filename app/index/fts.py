@@ -345,7 +345,12 @@ async def _bm25_search(
     sql = (
         "SELECT chunk_fts.chunk_id, chunk_fts.doc_id, chunk_fts.node_id, "
         "snippet(chunk_fts, 2, '<b>', '</b>', '…', 24) AS snippet, "
-        "bm25(chunk_fts, 3.0, 2.0, 1.0) AS score, "
+        # bm25 is negative (more negative = better). Multiplying an
+        # apparatus chunk's score by 0.25 moves it toward 0, i.e. below
+        # body chunks, while still letting it fill a page when nothing
+        # better exists.
+        f"bm25(chunk_fts, 3.0, 2.0, 1.0) * "
+        f"CASE WHEN {_APPARATUS_SQL} THEN 0.25 ELSE 1.0 END AS score, "
         "c.chunk_index, c.page_start AS chunk_page_start, "
         "c.page_end AS chunk_page_end, "
         "t.heading_num, t.heading_path, t.title, t.page_start, t.page_end "
@@ -487,15 +492,60 @@ async def doc_ids_for_filters(
 
 _FRONT_MATTER_RE = re.compile(
     r"参考文献|参考资料|引用文献|索引|目录|前言|封面|版权"
+    r"|references?|bibliography|appendix|appendices|supplement"
+    r"|additional results|frequently asked|faq|trajector",
+    re.IGNORECASE,
 )
 
 
+def _is_appendix_letter(text: str | None) -> bool:
+    """True for a heading or path that starts with a lone appendix letter.
+
+    "H Retrieval Collapse" / "D Trajectories > D.1 FEVER" are appendices;
+    the title alone often contains no word the regex can see.
+    """
+    value = (text or "").strip()
+    if not value:
+        return False
+    first = value.split(" ", 1)[0].split(">", 1)[0].strip()
+    return len(first) == 1 and first.isascii() and first.isupper()
+
+
 def _is_front_matter(hit: dict) -> bool:
-    """A chapter that is apparatus, not body text (references, index, …)."""
+    """A chapter that is apparatus, not body text (references, appendix, …)."""
     text = " ".join(
         [hit.get("heading_path") or "", hit.get("title") or ""]
     )
-    return bool(_FRONT_MATTER_RE.search(text))
+    if _FRONT_MATTER_RE.search(text):
+        return True
+    return _is_appendix_letter(hit.get("heading_path")) or _is_appendix_letter(
+        hit.get("title")
+    )
+
+
+# Appendix / references / FAQ chunks are apparatus: useful, but a query
+# should reach the body section first. The SQL condition mirrors
+# ``_is_front_matter`` so ranking (not only the post-sort) knows about it.
+_APPARATUS_SQL = (
+    "("
+    "lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%references%'"
+    " OR lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%bibliography%'"
+    " OR lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%appendix%'"
+    " OR lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%supplement%'"
+    " OR lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%frequently asked%'"
+    " OR lower(coalesce(t.heading_path, '') || ' ' || coalesce(t.title, ''))"
+    " LIKE '%trajector%'"
+    " OR (length(coalesce(t.heading_num, '')) = 1"
+    " AND t.heading_num GLOB '[A-Z]')"
+    " OR t.heading_path GLOB '[A-Z] *'"
+    " OR t.title GLOB '[A-Z] *'"
+    ")"
+)
 
 
 async def _search_chunks(
@@ -577,7 +627,12 @@ async def _search_chunks(
         else match
     )
     bm25_hits = (
-        await _bm25_search(db, query, body_match, remaining, routed_doc_ids)
+        # Over-fetch: apparatus hits (references / appendix / FAQ) are
+        # demoted below body sections, so the body hit must already be in
+        # the candidate pool rather than cut off by the raw BM25 rank.
+        await _bm25_search(
+            db, query, body_match, max(remaining * 3, remaining), routed_doc_ids
+        )
         if body_match and remaining
         else []
     )
@@ -595,8 +650,6 @@ async def _search_chunks(
         if hit.get("node_id") and hit["node_id"] in seen_node_ids:
             continue
         merged.append(hit)
-        if len(merged) >= top_k:
-            break
 
     merged = await _refine_generic_hits(
         db, query, merged, top_k, routed_doc_ids
@@ -618,6 +671,10 @@ async def _search_chunks(
     if echoed:
         echoed_ids = {id(hit) for hit in echoed}
         merged = echoed + [hit for hit in merged if id(hit) not in echoed_ids]
+
+    # The over-fetched BM25 tail exists so apparatus demotion has body
+    # candidates to promote; the page itself keeps the top_k contract.
+    merged = merged[:top_k]
 
     if not merged and identifier_routed and routed_doc_ids:
         return await _doc_fallback_hits(db, routed_doc_ids, top_k)
@@ -905,30 +962,38 @@ def _next_steps(hits: list[dict]) -> list[dict]:
 
 
 def _limit_per_doc(
-    results: list[dict], distinct_docs: int | None = 2
+    results: list[dict],
+    distinct_docs: int | None = 2,
+    distinct_nodes: bool = True,
 ) -> list[dict]:
-    """Cap hits per document so a single document cannot flood a results page.
+    """Cap hits per document and per TOC node.
 
-    ``None`` disables the cap. Exact section/title hits (route channels that
-    answer "where is X") are kept whole regardless — the cap only trims the
-    BM25 body tail, which is where one JD or one chapter can dominate the
-    top N with near-duplicate chunks. Order is preserved: first N of each
-    doc, then everything kept re-flattened in original rank order.
+    ``distinct_docs`` caps how many hits a single document may contribute;
+    ``None`` disables it. ``distinct_nodes`` keeps one chunk per section:
+    two chunks of the same "2.1 Models" node are near-duplicates in a
+    results page, and the second one pushes a different section off the
+    page. Exact section/title hits (route channels that answer "where is
+    X") are kept whole regardless — the caps only trim the BM25 body tail.
+    Order is preserved.
     """
-    if distinct_docs is None:
+    if distinct_docs is None and not distinct_nodes:
         return results
     counts: dict[str, int] = {}
+    seen_nodes: set[tuple[str, str]] = set()
     kept: list[dict] = []
     for hit in results:
         doc_id = hit.get("doc_id")
         match_type = hit.get("match_type")
-        if (
-            doc_id
-            and match_type not in {"section", "title"}
-            and counts.get(doc_id, 0) >= distinct_docs
-        ):
-            continue
-        if doc_id and match_type not in {"section", "title"}:
+        routed = match_type in {"section", "title"}
+        if doc_id and not routed:
+            if distinct_docs is not None and counts.get(doc_id, 0) >= distinct_docs:
+                continue
+            node_id = hit.get("node_id")
+            if distinct_nodes and node_id:
+                key = (doc_id, node_id)
+                if key in seen_nodes:
+                    continue
+                seen_nodes.add(key)
             counts[doc_id] = counts.get(doc_id, 0) + 1
         kept.append(hit)
     return kept
@@ -975,13 +1040,15 @@ async def scoped_search(
     filters: dict | None = None,
     mode: str = "auto",
     distinct_docs: int | None = 2,
+    distinct_nodes: bool = True,
 ) -> dict:
     """Search, optionally narrowed by collection and metadata filters.
 
     ``distinct_docs`` caps how many hits a single document may contribute
     (default 2), so one document never floods a results page; ``None``
-    disables the cap. Exact section/title hits are kept whole — the cap only
-    trims the BM25 body tail, which is where one document can dominate.
+    disables the cap. ``distinct_nodes`` (default true) keeps one chunk per
+    TOC node. Exact section/title hits are kept whole — the caps only trim
+    the BM25 body tail, which is where one document can dominate.
     ``mode`` accepts ``auto|lexical|semantic|hybrid`` (an unknown value is a
     ``ValueError``; the MCP layer turns it into a ToolError). Only lexical
     retrieval exists this round, so every mode runs the lexical pass:
@@ -1018,7 +1085,7 @@ async def scoped_search(
     def _envelope(
         results: list[dict], empty_reason: str | None, hints: list[str]
     ) -> dict:
-        results = _limit_per_doc(results, distinct_docs)
+        results = _limit_per_doc(results, distinct_docs, distinct_nodes)
         results = _decorate_pages(results)
         return {
             "results": results,
