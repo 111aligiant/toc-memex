@@ -1,6 +1,6 @@
 # 🦉 Toc Memex
 
-**给 agent 的本地文档图书馆：目录由它重建，页码它来对齐，引用钉在原文那一页。**
+**给 agent 的本地文档图书馆：目录由它重建，页码它来对齐，引用钉在具体小节。**
 
 `MIT` · `Python 3.12+` · 本地 SQLite · MCP · 无向量库
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
@@ -11,7 +11,7 @@
 
 ## 这一行就懂它
 
-Toc Memex 把一摞本地 PDF / 扫描件 / Word / Markdown 变成一台随时可核对的引擎：重建目录树、把印刷页码对齐到 PDF 物理页、把检索结果钉在具体页面上。agent 通过 MCP 查库，每条结果都带章节路径和 1-based 页码——它报出的引用和 PDF 阅读器显示的完全一致。
+Toc Memex 把一摞本地 PDF / 扫描件 / Word / Markdown 变成一台随时可核对的引擎：重建目录树、把印刷页码对齐到 PDF 物理页、把检索结果锚定到具体小节。agent 通过 MCP 查库，每条结果都带章节路径、小节的 `node_id` 和 1-based 页码——它报出的引用和 PDF 阅读器显示的完全一致。
 
 ![概览：一屏看清整个馆藏](assets/overview.png)
 
@@ -39,10 +39,14 @@ Toc Memex 把一摞本地 PDF / 扫描件 / Word / Markdown 变成一台随时�
 
 同类工具把 OCR 当黑盒，Toc Memex 把它当可对照的实验对象。内置「测试台」：同一份文档 × 不同 OCR（Paddle / Mistral / MinerU / Azure）× 不同 LLM，规则目录和 LLM 目录并排打分，对比跑在隔离目录里、不动正式库。选型有据、有对比记录，而不是凭感觉换 provider。
 
-站在两个开源底座上：
+## 致谢
+
+站在这些开源工具的肩膀上：
 
 - **OCR** —— [PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR) 提供结构化输出（`parsing_res_list` 的 label / bbox / order），是目录重建与页码对齐的原始依据。
 - **LLM 接入** —— [magpie](https://github.com/yetone/magpie) 本地模型网关提供低成本模型调用，Toc Memex 用 `/api/endpoints/magpie/probe` 探测本机默认端口。
+- **目录结构处理** —— [PageIndex](https://github.com/VectifyAI/PageIndex)（MIT）。书签/目录解析的核心逻辑取自它，见 [`vendor/pageindex/`](vendor/pageindex/NOTICE.md)。
+- **离线 PDF 引擎** —— [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)（PDFium 绑定）读 PDF 书签、提文本、渲染；[pdfplumber](https://github.com/jsvine/pdfplumber) 提供表格与版面矩形。
 
 ## 快速开始 · Quick start
 
@@ -96,7 +100,7 @@ uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
 
 ## 工程底数
 
-- 应用约 3.2 万行、测试约 2.4 万行（912 项测试全绿，80 个测试文件）——在没有向量库的约束下，把「出处可核对」这一件事做扎实。
+- 应用约 3.2 万行、测试约 2.2 万行（898 项测试全绿，79 个测试文件）——在没有向量库的约束下，把「出处可核对」这一件事做扎实。
 - 本地优先：一次 `pipx install` 拿到 CLI + MCP + Web，前端无第三方 UI 依赖。
 
 ## 边界
