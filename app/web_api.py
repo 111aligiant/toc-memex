@@ -1638,7 +1638,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     @app.get("/api/search")
     async def api_search(
         q: str = Query(min_length=1),
-        top: int = Query(default=20, le=100),
+        top: int = Query(default=20, ge=1, le=100),
         collection: str = "",
     ) -> dict:
         from .index.collections import CollectionNotFound
