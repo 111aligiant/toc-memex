@@ -1,12 +1,17 @@
-# 🦉 Toc Memex
+<p align="center">
+  <img src="assets/icon.png" width="96" alt="Toc Memex 图标" />
+</p>
+
+<h1 align="center">Toc Memex</h1>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License: MIT" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12--3.13-blue.svg?style=flat-square" alt="Python 3.12–3.13" /></a>
+  <img src="https://img.shields.io/badge/index-SQLite%20FTS5-blue.svg?style=flat-square" alt="SQLite FTS5" />
+  <img src="https://img.shields.io/badge/interface-MCP-blue.svg?style=flat-square" alt="MCP" />
+</p>
 
 Toc Memex 把本地 PDF、扫描件、Word 与 Markdown 编成一个可核对的馆藏：目录还原到小节，印刷页码对齐到 PDF 物理页，检索结果、引用、批注与勘误都落在同一个地址上（`doc_id → node_id → page`）。用于交付物需要原文与页码的场景：标准、法规、合同、专利、检测报告、审计底稿。索引与记录留在本地 SQLite，原始文件与 OCR 产物留在数据目录。
-
-`Python 3.12 / 3.13` · `本地 SQLite + FTS5` · `CLI / MCP / Web` · `无向量库`
-
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
-
-![图标：本地目录图书馆](assets/icon.png)
 
 ![概览：馆藏计数、待处理问题、任务与最近手记](assets/overview.png)
 
@@ -31,25 +36,6 @@ Toc Memex 把本地 PDF、扫描件、Word 与 Markdown 编成一个可核对的
 ## 挂在源位置上的记录
 
 `activity`、`agent_notes`、`errata`、`usage_log`、`tasks` 以 `doc_id / node_id / page` 为锚点，不绑定会话。勘误生命周期是 `proposed → confirmed / rejected`，确认需要第二个 agent 独立复核，修正不覆盖旧记录而是追加新行。`task_timeline` 把同一任务的读写、批注与勘误合成一条时间线；`add_note` 与 `activity_write` 写入的交接和勘误会出现在下一次会话的检索与阅读结果里。未经 `confirmed` 的勘误不进入检索返回，`used / unused` 由 `mark_used` 单独记录。
-
-## 评测记录
-
-本地 round A 评测为 5 份文档、16 道评分题，题目与期望保存在 `benchmarks/papers/`。`benchmarks/` 与 `docs/` 按 `.gitignore` 不随公开仓库分发，仓库内不含 PDF 与语料。
-
-| 指标（2026-11-23 首轮） | 值 |
-|---|---|
-| 题目 / 文档 | 16 / 5 |
-| hit@k（k=5） | 68.75% |
-| primary@1 | 25.00% |
-| page@1 | 37.50% |
-| MRR | 0.5156 |
-| citation_page_rate | 100.00% |
-| citation_leak_rate | 0.00% |
-| ask_page_rate | 62.50% |
-
-配置查询侧双语词表后，同一组 16 题的 hit@k 升至 87.50%；单独隔离的 4 道跨语言题从 0/4 到 3/4。首轮的 5 次未命中都来自中文提问查英文文档；无书签也无印刷目录的 5 页期刊文章目录退化为单个 root；`4.2` 这类章节号在不同文档间重号时仍会撞车。
-
-Web 的测试台支持同一份文档切换 OCR provider（Paddle / Mistral / MinerU / Azure）与 LLM，把规则目录和 LLM 目录并排打分，对照跑在隔离目录，不写正式库。
 
 ## 快速开始
 
@@ -110,7 +96,7 @@ uvx --from git+https://github.com/111aligiant/toc-memex toc-memex-mcp
 
 - 主要适配目录结构完整的规范文档（PDF 书签、印刷目录页或 Word 标题样式）。无目录的散页扫描件与二手资料适配有限。
 - Excel / CSV / TSV 在 CLI 与 Web 的分发点拒绝入库。
-- 词法检索对同义换词召回弱；跨语言检索依赖 `TOCMEMEX_SEARCH_SYNONYMS` 配置，词表过宽会把英文全文排到中文目标章节之前。
+- 词法检索对同义换词召回弱；跨语言检索依赖 `TOCMEMEX_SEARCH_SYNONYMS` 配置，默认不启用。
 - OCR 默认走云端 PaddleOCR-VL，可换本地或私有 provider，`TOCMEMEX_OCR_ALLOW_PRIVATE_HOSTS=1` 放开内网端点。
 - DOCX / DOC 直读依赖 Word COM（仅 Windows）；没有 Word 时先转 PDF。
 - Web 服务无登录，默认只绑 `127.0.0.1`；对外暴露前看 `TOCMEMEX_ALLOW_NONLOCAL` 的说明。
