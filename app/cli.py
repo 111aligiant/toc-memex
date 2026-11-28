@@ -362,6 +362,38 @@ async def _reindex(args) -> int:
         await engine.dispose()
 
 
+async def _backfill_simhash(args) -> int:
+    """Fill ``documents.simhash`` for documents ingested before it existed.
+
+    Near-duplicate hints read this column; rows without it fall back to an
+    on-demand fingerprint, but precomputing once keeps ingest fast.
+    """
+    from sqlalchemy import select
+
+    from .index import similarity
+    from .models import Document
+
+    settings = get_settings()
+    engine = make_engine(settings.tocmemex_db_path)
+    await init_db(engine)
+    try:
+        async with session_factory(engine)() as db:
+            stmt = select(Document).where(Document.simhash.is_(None))
+            if not args.all_docs:
+                stmt = stmt.where(Document.status == "ready")
+            docs = (await db.execute(stmt)).scalars().all()
+            filled = 0
+            for doc in docs:
+                value = await similarity.ensure_fingerprint(db, doc)
+                if value and doc.simhash == value:
+                    filled += 1
+            await db.commit()
+        print(f"filled {filled} / {len(docs)}")
+        return 0
+    finally:
+        await engine.dispose()
+
+
 async def _images(args) -> int:
     """Download figure images an earlier ingest failed to fetch."""
     settings = get_settings()
@@ -796,6 +828,11 @@ def main(argv: list[str] | None = None) -> int:
     images.add_argument("doc_id", nargs="?")
     images.add_argument("--all", action="store_true", dest="all_docs")
 
+    simhash = sub.add_parser(
+        "backfill-simhash", help="compute near-duplicate fingerprints for old documents"
+    )
+    simhash.add_argument("--all", action="store_true", dest="all_docs")
+
     baseline = sub.add_parser(
         "baseline", help="create / list / restore pre-curator baselines"
     )
@@ -855,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         "ask": _ask,
         "reindex": _reindex,
         "images": _images,
+        "backfill-simhash": _backfill_simhash,
         "provenance": _provenance,
         "baseline": _baseline,
         "anchor-ids": _anchor_ids,

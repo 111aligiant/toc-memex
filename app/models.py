@@ -61,6 +61,11 @@ class Document(Base):
     keywords: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 64-bit SimHash of title + the first ~500 chars of body, as hex. Near
+    # duplicates (the same JD screenshotted twice with different bytes) hash
+    # close together; exact byte duplicates are already caught by
+    # ``content_hash``. NULL until computed (older documents).
+    simhash: Mapped[str | None] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Live ingest state for the 解析队列. The row is written before parsing

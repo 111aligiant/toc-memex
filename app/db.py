@@ -153,11 +153,14 @@ async def _patch_legacy_columns(conn) -> None:  # noqa: ANN001
 
     # documents: live ingest progress (stage / percent / parse scheme) shown
     # by the 解析队列 page. Written before parsing starts so the queue can
-    # list a document while OCR is still running.
+    # list a document while OCR is still running. ``simhash`` is the 64-bit
+    # near-duplicate fingerprint (see app/index/similarity.py); NULL until
+    # computed, so older rows fall back to on-demand computation.
     for column, ddl in (
         ("stage", "VARCHAR(40)"),
         ("progress", "INTEGER"),
         ("parse_plan", "VARCHAR(80)"),
+        ("simhash", "VARCHAR(16)"),
     ):
         await _add_column_if_missing(conn, "documents", column, ddl)
 
