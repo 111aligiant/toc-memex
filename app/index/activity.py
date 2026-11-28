@@ -566,12 +566,16 @@ async def upsert_ingest_note(
     doc_id: str,
     body: str,
     author: str = INGEST_NOTE_AUTHOR,
+    session_id: str | None = None,
 ) -> AgentNote | None:
     """Set (or clear, with an empty body) a document's 入库备注.
 
     One per document: a second write edits the existing row instead of
     appending another note, so the library list has a single value to show
-    and edit. Only the web layer calls this — no agent-facing tool does.
+    and edit. When the author changes — an agent ingesting a file after a
+    human wrote the note — the previous body is kept as a ``NoteRevision``
+    before the new text lands, so "who wrote what" survives. Same-author
+    edits overwrite in place, which is what the web editor relies on.
     """
     text = (body or "").strip()
     row = await ingest_note(db, doc_id)
@@ -585,11 +589,56 @@ async def upsert_ingest_note(
             kind=INGEST_NOTE_KIND,
             body=text,
             doc_id=doc_id,
+            session_id=session_id,
         )
         db.add(row)
-    else:
+    elif row.author != author:
+        # Preserve the previous author's text as revision 1 before replacing
+        # it. Materialise rev 1 from the current body if no chain exists yet.
+        existing_revs = (
+            (
+                await db.execute(
+                    select(NoteRevision).where(NoteRevision.note_id == row.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not existing_revs:
+            db.add(
+                NoteRevision(
+                    note_id=row.id,
+                    rev=1,
+                    body=row.body,
+                    author=row.author,
+                    reason=None,
+                    created_at=row.created_at,
+                )
+            )
+            last_rev = 1
+        else:
+            last_rev = max(rev.rev for rev in existing_revs)
+        rev = max(last_rev, row.current_rev or 1) + 1
+        db.add(
+            NoteRevision(
+                note_id=row.id,
+                rev=rev,
+                body=text,
+                author=author,
+                reason="入库备注改由 " + author + " 维护",
+                created_at=utcnow_iso(),
+            )
+        )
         row.body = text
         row.author = author
+        row.current_rev = rev
+        row.revised_at = utcnow_iso()
+        row.revised_by = author
+        row.session_id = session_id or row.session_id
+    else:
+        row.body = text
+        if session_id:
+            row.session_id = session_id
     await db.flush()
     return row
 
