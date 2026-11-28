@@ -102,6 +102,7 @@ function statusLabel(item) {
     pending: '待上传',
     uploading: '上传中',
     queued: '排队中',
+    parsing: '解析中',
     indexing: '解析中',
     ready: '已入库',
     duplicate: '库中已有',
@@ -195,7 +196,9 @@ async function start() {
 
   while (token === runToken) {
     const active = items.value.filter(
-      (item) => item.uploadId && ['queued', 'indexing', 'uploading'].includes(item.status),
+      (item) =>
+        item.uploadId &&
+        ['queued', 'parsing', 'indexing', 'uploading'].includes(item.status),
     )
     if (!active.length) break
     await new Promise((resolve) => setTimeout(resolve, POLL_MS))

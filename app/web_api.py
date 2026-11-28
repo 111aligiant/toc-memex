@@ -14,14 +14,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import sqlite3
-import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import AsyncIterator
@@ -53,6 +51,11 @@ from .ingest.bench import run_scenario
 from .ingest.export import ExportError, build_export, export_kind
 from .ingest.provenance import run_out
 from .ingest.toc import validate_toc
+from .ingest.validate import (
+    display_ingest_error,
+    friendly_ingest_error,
+    validate_ingest_file,
+)
 from .llm.client import LLMError, llm_complete
 from .llm.endpoints import endpoint_out
 from .models import AgentNote, Document, ModelEndpoint, OcrEndpoint, TocBenchRun, TocBenchScenario, new_uuid, utcnow_iso
@@ -65,20 +68,12 @@ from .paths import is_safe_doc_id
 logger = logging.getLogger(__name__)
 
 _MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-_UPLOAD_STATUSES = ("queued", "indexing", "ready", "duplicate", "failed")
+_UPLOAD_STATUSES = ("queued", "parsing", "indexing", "ready", "duplicate", "failed")
 # A child ingest that never returns would otherwise leave the upload record
 # stuck at "indexing" forever and leak the child process. Cap the wait so a
 # hung parse (deadlocked pypdfium2, an OCR endpoint that never answers, a
 # runaway loop) becomes a recoverable "failed" the user can re-upload.
 _INGEST_TIMEOUT_S = 30 * 60
-
-
-def _stream_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for piece in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(piece)
-    return digest.hexdigest()
 
 
 async def _communicate_with_timeout(process) -> tuple[bytes, bytes]:
@@ -116,148 +111,24 @@ async def _communicate_with_timeout(process) -> tuple[bytes, bytes]:
         raise
 
 
-_IMAGE_PREFIXES = (
-    b"\x89PNG\r\n\x1a\n",
-    b"\xff\xd8\xff",
-    b"GIF87a",
-    b"GIF89a",
-    b"BM",
-    b"II*\x00",
-    b"MM\x00*",
-)
-
-
 def _validate_upload_content(path: Path, name: str) -> None:
     """Reject files whose bytes contradict their extension.
 
-    This catches the common "renamed or truncated file" case before a
-    background ingest spends minutes on it. Deeper corruption that still
-    has a valid header is reported by the ingest task with a friendly
-    error, not a 4xx, because ingest is intentionally asynchronous.
+    The checks live in ``app.ingest.validate`` so the CLI and MCP surface
+    apply the same rules; this wrapper turns the ``ValueError`` into the 400
+    the upload dialog already understands.
     """
-    suffix = Path(name).suffix.lower()
-    with path.open("rb") as handle:
-        head = handle.read(1024)
-    if suffix == ".pdf":
-        if b"%PDF-" not in head:
-            raise HTTPException(
-                status_code=400, detail="文件不是有效的 PDF：缺少 %PDF 文件头"
-            )
-    elif suffix == ".docx":
-        if not head.startswith(b"PK\x03\x04"):
-            raise HTTPException(
-                status_code=400, detail="文件不是有效的 DOCX：不是 ZIP 容器"
-            )
-    elif suffix == ".doc":
-        if not head.startswith(bytes.fromhex("d0cf11e0a1b11ae1")):
-            raise HTTPException(
-                status_code=400, detail="文件不是有效的 DOC：不是 Word 复合文档"
-            )
-    elif suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}:
-        if not any(head.startswith(prefix) for prefix in _IMAGE_PREFIXES):
-            raise HTTPException(
-                status_code=400, detail="文件不是有效的图片：文件头无法识别"
-            )
-    elif suffix == ".webp":
-        if not (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
-            raise HTTPException(
-                status_code=400, detail="文件不是有效的 WEBP：文件头无法识别"
-            )
+    try:
+        validate_ingest_file(path, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-_INGEST_ERROR_HINTS = (
-    ("PdfReadError", "PDF 文件损坏或无法读取"),
-    ("PdfStreamError", "PDF 文件损坏或无法读取"),
-    ("EOFError", "文件内容不完整或已损坏"),
-    ("BadZipFile", "DOCX 文件损坏（ZIP 容器不完整）"),
-    ("UnidentifiedImageError", "图片文件损坏或格式不受支持"),
-    ("ModuleNotFoundError", "解析依赖缺失，请检查安装"),
-    ("OCR", "OCR 解析失败；到设置页点「测试」检查端点，或点「重新上传」重试"),
-)
-
-
-def _friendly_ingest_error(detail: str) -> str:
-    """Turn a child-process traceback into something a user can act on.
-
-    The text must answer two questions the UI cannot: what actually failed
-    (local file, credentials, rate limit, or the vendor's own 5xx), and what
-    to do next. The retry path is the document row's 「重新上传」 button.
-    """
-    text = detail or ""
-
-    # A vendor async job that the OCR service itself failed (state=failed).
-    # The *last* occurrence is the raised exception; earlier ones are
-    # traceback source lines that contain the literal "job failed:".
-    if "job failed" in text:
-        tail = text.rsplit("job failed", 1)[1]
-        reason = tail.splitlines()[0].strip() if tail else ""
-        reason = re.sub(r"^\s*\(job [^)]+\):\s*", "", reason).strip(" :\"'")
-        reason = reason[:200] or "未知原因"
-        lowered = reason.lower()
-        if "500" in reason:
-            return (
-                f"解析失败：OCR 服务端执行任务时返回 500（{reason}）。"
-                "文件本身没问题，这是 OCR 服务的临时故障。"
-                "点这条任务的「重新上传」重试，通常第二次就能通过；"
-                "若连续失败，到「设置 → OCR 端点」点「测试」确认服务可用，"
-                "或换一张图再试。"
-            )
-        if "401" in reason or "403" in reason or "认证" in reason or "auth" in lowered:
-            return (
-                f"解析失败：OCR 服务认证失败（{reason}）。"
-                "到「设置 → OCR 端点」检查 Token 后点「测试」。"
-            )
-        if "429" in reason or "限流" in reason or "频繁" in reason or "limit" in lowered:
-            return (
-                f"解析失败：OCR 服务限流（{reason}）。"
-                "等 1 分钟后点「重新上传」再试。"
-            )
-        return (
-            f"解析失败：OCR 服务端任务执行失败（{reason}）。"
-            "点「重新上传」重试；若反复失败，到设置页测试 OCR 端点，"
-            "或换一张图/把图片缩小后再试。"
-        )
-
-    lowered = text.lower()
-    if "submit failed http 401" in lowered or "submit failed http 403" in lowered:
-        return (
-            "解析失败：OCR 服务拒绝认证（HTTP 401/403）。"
-            "到「设置 → OCR 端点」重新填写 Token 并点「测试」。"
-        )
-    if "submit failed http 429" in lowered:
-        return "解析失败：OCR 服务限流（HTTP 429）。等 1 分钟后点「重新上传」再试。"
-    if "poll timeout" in lowered:
-        return (
-            "解析失败：OCR 服务超过等待时限仍未完成。"
-            "稍后在解析队列点「重新上传」；大文件可先拆分或压缩。"
-        )
-    if "submit failed after retries" in lowered:
-        return (
-            "解析失败：连接不上 OCR 服务（已自动重试）。"
-            "检查网络和「设置 → OCR 端点」的地址/Token 后点「测试」。"
-        )
-    for needle, message in _INGEST_ERROR_HINTS:
-        if needle in text:
-            return f"解析失败：{message}"
-    return "解析失败：文件无法解析，请确认格式与完整性"
-
-
-def _display_ingest_error(error: str | None) -> str | None:
-    """Hide unreadable errors left by older versions in the queue.
-
-    Before the child ran with PYTHONIOENCODING=utf-8, a GBK traceback was
-    decoded as UTF-8 and the vendor's Chinese message became replacement
-    characters. The raw text is gone, so say what happened and how to
-    recover instead of showing mojibake forever.
-    """
-    if not error:
-        return None
-    if "�" in error or "data.get('errorMsg')" in error:
-        return (
-            "解析失败：OCR 服务端临时故障（旧版本记录，服务端错误详情已丢失）。"
-            "点「重新上传」用原文件重试即可。"
-        )
-    return error
+# Ingest error translation and file validation live in app.ingest.validate
+# so the CLI and MCP surface use the same wording; the web layer keeps these
+# names because tests and call sites import them here.
+_friendly_ingest_error = friendly_ingest_error
+_display_ingest_error = display_ingest_error
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -897,7 +768,51 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .ingest.bench import fail_stale_processing_scenarios
 
     await fail_stale_processing_scenarios(session_factory(_app_engine(app)))
-    yield
+
+    # Ingest jobs left active by a previous process: adopt finished ones,
+    # fail dead ones, leave queued ones for the pump. This is what makes a
+    # GET by upload id answer a terminal state after a restart.
+    from .ingest import jobs as jobs_mod
+
+    try:
+        await jobs_mod.reconcile_jobs(
+            _app_engine(app),
+            db_path=app.state.db_path,
+            data_dir=Path(app.state.data_dir),
+        )
+    except Exception:
+        logger.exception("ingest job reconciliation failed")
+
+    # A background pump keeps a queue that outlived its uploader moving even
+    # if nobody is polling. Cheap: it only claims when capacity is free.
+    pump_stop = asyncio.Event()
+
+    async def _pump_loop() -> None:
+        while not pump_stop.is_set():
+            try:
+                await jobs_mod.pump(
+                    _app_engine(app),
+                    db_path=app.state.db_path,
+                    data_dir=Path(app.state.data_dir),
+                )
+            except Exception:
+                logger.exception("ingest pump failed")
+            try:
+                await asyncio.wait_for(pump_stop.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                continue
+
+    pump_task = asyncio.create_task(_pump_loop())
+    app.state.ingest_pump_task = pump_task
+    try:
+        yield
+    finally:
+        pump_stop.set()
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None = None) -> FastAPI:
@@ -912,14 +827,9 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     app.state.data_dir = data_dir or db_path.parent
     app.state.web_dir = web_dir
     app.state.search_engine = None
-    # Upload progress lives in memory: a browser refresh loses the ids but
-    # never the work — ingest keeps running and the document appears in the
-    # library when it finishes.
-    app.state.uploads = {}
-    # Strong references to running ingest tasks. Starlette's BackgroundTasks
-    # would be awaited on the same keep-alive connection: the next file in a
-    # multi-file upload would not start until the previous document finished
-    # parsing. A detached task avoids that.
+    # Strong references to the short-lived tasks that start the ingest queue.
+    # Job state itself lives in the ``ingest_jobs`` table, not in memory, so
+    # a restart no longer loses a running upload.
     app.state.upload_tasks = set()
     # Same reason as uploads: the run loop is a detached task, and dropping
     # the reference would let Python garbage-collect it mid-run.
@@ -1076,140 +986,24 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
     # only streams the file to disk and hands it to a background task. The
     # returned upload id is polled for status; the document itself appears
     # in the normal library list once ingest commits it.
-    async def _run_upload(
-        upload_id: str,
-        path: Path,
-        collection_id: str | None,
-        image_mode: str = "structured",
-        ingest_note: str = "",
-    ) -> None:
-        from .index import activity as activity_mod
-        from .index import collections as collections_mod
+    async def _run_upload(upload_id: str) -> None:
+        """Kick the durable job layer; the child does the work.
 
-        record = app.state.uploads[upload_id]
-        note_text = (ingest_note or "").strip()
-        # Ingest runs in a child process for the same reason the CLI exists:
-        # parsing a 300-page PDF is CPU-bound and would freeze the event loop
-        # (and this status endpoint) for minutes. The child inherits the
-        # database and data dir this server was started with, not whatever
-        # the shell's .env says.
-        project_root = Path(__file__).resolve().parent.parent
-        upload_env = os.environ.copy()
-        upload_env["TOCMEMEX_DB_PATH"] = str(Path(db_path).resolve())
-        upload_env["TOCMEMEX_DATA_DIR"] = str(Path(app.state.data_dir).resolve())
-        # The child writes its traceback to stderr. Without this, a Chinese
-        # Windows console encodes it as GBK while the parent decodes UTF-8,
-        # turning the vendor's error message into replacement characters —
-        # exactly what made "OCR识别任务失败" unreadable in the UI.
-        upload_env["PYTHONIOENCODING"] = "utf-8"
+        Parsing happens in a detached child (``app.cli ingest --job-id``)
+        that also writes the collection, the 入库备注 and the terminal
+        state, so the result survives this server restarting. This task only
+        starts the queue.
+        """
+        from .ingest import jobs as jobs_mod
+
         try:
-            active_engine = engine()
-            Session = session_factory(active_engine)
-            digest = await asyncio.to_thread(_stream_digest, path)
-
-            async with Session() as session:
-                existing = (
-                    await session.execute(
-                        sqlalchemy.select(Document).where(
-                            Document.namespace_id == "shared",
-                            Document.content_hash == digest,
-                        )
-                    )
-                ).scalar_one_or_none()
-                if existing is not None and existing.status != "failed":
-                    record["docId"] = existing.id
-                    record["status"] = "duplicate"
-                    record["message"] = "库中已有相同文件，未重复入库"
-                    if collection_id and existing.collection_id is None:
-                        try:
-                            await collections_mod.assign_documents(
-                                session, [existing.id], collection_id
-                            )
-                            await session.commit()
-                            record["message"] += "；已归入所选分区"
-                        except ValueError as exc:
-                            await session.rollback()
-                            record["message"] += f"；分区不存在：{exc}"
-                    if note_text:
-                        # A re-upload with a note updates the existing
-                        # document's 入库备注 rather than adding another.
-                        await activity_mod.upsert_ingest_note(
-                            session, existing.id, note_text
-                        )
-                        await session.commit()
-                        record["message"] += "；已更新入库备注"
-                    shutil.rmtree(path.parent, ignore_errors=True)
-                    return
-
-            record["status"] = "indexing"
-            process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-m",
-                "app.cli",
-                "ingest",
-                str(path),
-                "--image-mode",
-                image_mode,
-                cwd=str(project_root),
-                env=upload_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            await jobs_mod.pump(
+                engine(),
+                db_path=Path(db_path),
+                data_dir=Path(app.state.data_dir),
             )
-            stdout, stderr = await _communicate_with_timeout(process)
-            if process.returncode != 0:
-                detail = (stderr or stdout).decode("utf-8", "replace").strip()
-                logger.warning("ingest failed for %s: %s", path, detail[-1200:])
-                raise RuntimeError(_friendly_ingest_error(detail))
-            printed = [
-                line.strip()
-                for line in stdout.decode("utf-8", "replace").splitlines()
-                if line.strip()
-            ]
-            if not printed:
-                raise RuntimeError("ingest finished without a document id")
-            doc_id = printed[-1]
-
-            if collection_id:
-                async with Session() as session:
-                    try:
-                        await collections_mod.assign_documents(
-                            session, [doc_id], collection_id
-                        )
-                        await session.commit()
-                    except ValueError as exc:
-                        await session.rollback()
-                        record["message"] = f"已入库，但分区不存在：{exc}"
-            if note_text:
-                async with Session() as session:
-                    await activity_mod.upsert_ingest_note(session, doc_id, note_text)
-                    await session.commit()
-            record["docId"] = doc_id
-            record["status"] = "ready"
-        except Exception as exc:
-            logger.exception("upload %s failed", upload_id)
-            record["status"] = "failed"
-            record["error"] = str(exc) or exc.__class__.__name__
-            # Ingest may have written the document row before the failure.
-            # Leaving it "indexing" forever would make the library claim a
-            # job is still running when nothing is.
-            try:
-                digest = await asyncio.to_thread(_stream_digest, path)
-                Session = session_factory(engine())
-                async with Session() as session:
-                    row = (
-                        await session.execute(
-                            sqlalchemy.select(Document).where(
-                                Document.namespace_id == "shared",
-                                Document.content_hash == digest,
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    if row is not None and row.status != "ready":
-                        row.status = "failed"
-                        row.error = (str(exc) or exc.__class__.__name__)[:1000]
-                        await session.commit()
-            except Exception:
-                logger.exception("could not mark upload %s failed", upload_id)
+        except Exception:
+            logger.exception("upload %s could not be started", upload_id)
 
     @app.post("/api/uploads")
     async def api_upload(
@@ -1217,6 +1011,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         collection_id: str | None = Form(default=None, alias="collectionId"),
         image_mode: str = Form(default="structured", alias="imageMode"),
         ingest_note: str = Form(default="", alias="ingestNote"),
+        actor: str = Form(default="human", alias="actor"),
     ) -> dict:
         from .ingest.pipeline import infer_doc_type, normalize_image_mode
 
@@ -1286,44 +1081,52 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise
 
-        record = {
-            "id": upload_id,
-            "filename": name,
-            "size": size,
-            "status": "queued",
-            "collectionId": collection_id or None,
-            "imageMode": normalize_image_mode(image_mode)
+        from .ingest import jobs as jobs_mod
+
+        resolved_mode = (
+            normalize_image_mode(image_mode)
             if infer_doc_type(Path(name)) == "image"
-            else "structured",
-            "ingestNote": ingest_note.strip(),
-            "docId": None,
-            "error": None,
-            "message": "",
-            "createdAt": utcnow_iso(),
-        }
-        app.state.uploads[upload_id] = record
-        task = asyncio.create_task(
-            _run_upload(
-                upload_id,
-                target,
-                collection_id,
-                record["imageMode"],
-                record["ingestNote"],
-            )
+            else "structured"
         )
+        job = await jobs_mod.create_job(
+            engine(),
+            file_path=target,
+            filename=name,
+            size=size,
+            collection_id=collection_id or None,
+            image_mode=resolved_mode,
+            ingest_note=ingest_note.strip(),
+            actor=actor or "human",
+            source="web",
+            job_id=upload_id,
+        )
+        task = asyncio.create_task(_run_upload(upload_id))
         app.state.upload_tasks.add(task)
         task.add_done_callback(app.state.upload_tasks.discard)
-        return {"upload": record}
+        return {"upload": jobs_mod.upload_record(job)}
 
     @app.get("/api/uploads/{upload_id}")
-    def api_upload_status(upload_id: str) -> dict:
-        record = app.state.uploads.get(upload_id)
-        if record is None:
-            raise HTTPException(status_code=404, detail="upload not found")
-        payload = dict(record)
-        if record.get("docId"):
+    async def api_upload_status(upload_id: str) -> dict:
+        """Read a job from the database, so a restart does not lose it.
+
+        The record used to live in ``app.state.uploads`` (memory); a job
+        that outlived a restart answered 404 while its document could be
+        ``ready``. Now the row is durable and the status is derived from the
+        live document, so the same words appear here and in ``/api/jobs``.
+        """
+        from .ingest import jobs as jobs_mod
+
+        job = await jobs_mod.get_job(engine(), upload_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="没有这个上传任务。服务重启后任务仍在库中，请核对 id；"
+                "若文档已入库，可在文档列表按文件名或 content_hash 检索。",
+            )
+        payload = jobs_mod.upload_record(job)
+        if payload.get("docId"):
             try:
-                row = _doc_row(db_path, record["docId"])
+                row = _doc_row(db_path, payload["docId"])
                 payload["document"] = {
                     "id": row["id"],
                     "title": row["title"],
@@ -1333,7 +1136,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                 }
             except HTTPException:
                 pass
-        return payload
+        return {"upload": payload}
 
     @app.get("/api/overview")
     def api_overview() -> dict:
@@ -1417,11 +1220,8 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
             await session.commit()
 
         removed = _remove_document_files(app.state.data_dir, doc_id, file_path)
-        # The upload record is only a progress row; dropping it keeps the
-        # queue from offering a retry for a document that no longer exists.
-        for upload_id, record in list(app.state.uploads.items()):
-            if record.get("docId") == doc_id:
-                app.state.uploads.pop(upload_id, None)
+        # The job's doc_id is ON DELETE SET NULL, so the history row survives
+        # without pointing at a document that no longer exists.
         _invalidate_cache()
         return {"deleted": doc_id, "files": removed}
 
@@ -2101,38 +1901,50 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
         return {"logMode": mode}
 
     @app.get("/api/jobs")
-    def api_jobs() -> dict:
+    async def api_jobs() -> dict:
         """The ingest queue: documents that are not ready yet.
 
-        Rows now carry the live stage/percent/scheme written by ingest, so
-        the page can show what is happening instead of a bare "解析中".
-        Uploads that have not reached the database yet (the child process
-        is still starting) are merged in from the in-memory upload table.
+        Rows carry the live stage/percent/scheme written by ingest, so the
+        page shows what is happening instead of a bare "解析中". Jobs that
+        have not reached the database yet (still ``queued``) come from the
+        durable ``ingest_jobs`` table, so they survive a restart too.
         """
+        from .ingest import jobs as jobs_mod
+
         documents = _doc_summaries(db_path, app.state.data_dir)
+        # Include running jobs, not just queued ones: a parsing job holds the
+        # collection / image mode / 入库备注 that the 「重新上传」 prefill needs,
+        # and the document row does not.
+        active_jobs = await jobs_mod.list_jobs(
+            engine(), statuses=jobs_mod.ACTIVE_STATUSES, limit=200
+        )
 
-        def upload_record_for(file_path: str | None) -> dict | None:
-            """The in-memory upload row that produced this document.
+        def job_for(doc_id: str | None, file_path: str | None) -> dict | None:
+            """The durable job that produced this document, if any.
 
-            Uploads live under ``data/uploads/<upload_id>/<name>``; the
-            record holds what the document does not (the requested
+            The job holds what the document does not (the requested
             collection, image mode and 入库备注), which is exactly what the
-            「重新上传」 prefill needs. After a server restart it is gone and
-            the document's own fields are the fallback.
+            「重新上传」 prefill needs. Unlike the old in-memory record it is
+            still there after a restart.
             """
-            if not file_path:
-                return None
-            parent = Path(file_path).parent
-            if parent.parent.name != "uploads":
-                return None
-            return app.state.uploads.get(parent.name)
+            for job in active_jobs:
+                if doc_id and job.get("doc_id") == doc_id:
+                    return job
+            if file_path:
+                for job in active_jobs:
+                    if job.get("file_path") == file_path:
+                        return job
+            return None
 
         jobs = []
+        seen_job_ids: set[str] = set()
         for doc in documents:
             if doc["status"] == "ready":
                 continue
             failed = doc["status"] == "failed"
-            record = upload_record_for(doc.get("filePath")) or {}
+            job = job_for(doc["id"], doc.get("filePath")) or {}
+            if job.get("id"):
+                seen_job_ids.add(job["id"])
             plan = doc.get("plan") or ""
             jobs.append(
                 {
@@ -2140,7 +1952,7 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                     "docId": doc["id"],
                     "name": doc["filename"],
                     "type": doc["type"],
-                    "status": "failed" if failed else "parsing",
+                    "status": doc["status"],
                     "stage": doc.get("stage") or ("解析失败" if failed else "解析中"),
                     "progress": doc.get("progress")
                     if doc.get("progress") is not None
@@ -2153,43 +1965,41 @@ def create_app(db_path: Path, data_dir: Path | None = None, web_dir: Path | None
                     # Retry prefill: the original file comes from
                     # /api/documents/{id}/file, these are the choices.
                     "canRetry": failed,
-                    "collectionId": record.get("collectionId")
+                    "collectionId": job.get("collection_id")
                     or doc.get("collectionId"),
-                    "imageMode": record.get("imageMode")
+                    "imageMode": job.get("image_mode")
                     or ("text" if "纯文本" in plan else "structured"),
-                    "ingestNote": record.get("ingestNote")
+                    "ingestNote": job.get("ingest_note")
                     or doc.get("ingestNote"),
                 }
             )
 
-        known_names = {job["name"] for job in jobs}
-        for record in list(app.state.uploads.values()):
-            # Only the pre-database window. Once the child starts, the
-            # document row above is the single source of truth.
-            if record.get("status") != "queued":
+        # Queued jobs that have not created a document yet.
+        for job in active_jobs:
+            if job["id"] in seen_job_ids:
                 continue
-            if record.get("filename") in known_names:
+            if job.get("doc_id"):
                 continue
             jobs.append(
                 {
-                    "id": record["id"],
+                    "id": job["id"],
                     "docId": None,
-                    "name": record.get("filename") or "未命名",
+                    "name": job.get("filename") or "未命名",
                     "type": "上传",
-                    "status": "parsing",
-                    "stage": "排队等待解析",
-                    "progress": 2,
+                    "status": "queued",
+                    "stage": job.get("stage") or "排队等待解析",
+                    "progress": job.get("progress") or 0,
                     "plan": "OCR 结构化"
-                    if record.get("imageMode") != "text"
+                    if job.get("image_mode") != "text"
                     else "OCR 纯文本",
-                    "ns": "shared",
+                    "ns": job.get("namespace") or "shared",
                     "error": None,
-                    "time": record.get("createdAt"),
-                    "startedAt": record.get("createdAt"),
+                    "time": job.get("created_at"),
+                    "startedAt": job.get("created_at"),
                     "canRetry": False,
-                    "collectionId": record.get("collectionId"),
-                    "imageMode": record.get("imageMode") or "structured",
-                    "ingestNote": record.get("ingestNote") or "",
+                    "collectionId": job.get("collection_id"),
+                    "imageMode": job.get("image_mode") or "structured",
+                    "ingestNote": job.get("ingest_note") or "",
                 }
             )
         jobs.sort(key=lambda job: job.get("time") or "", reverse=True)

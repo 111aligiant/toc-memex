@@ -130,10 +130,10 @@ def make_client(tmp_path: Path) -> TestClient:
 
 
 def wait_upload(client: TestClient, upload_id: str, timeout: float = 60.0) -> dict:
-    """Poll a detached ingest task; the POST returns before it finishes."""
+    """Poll a detached ingest job; the POST returns before it finishes."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        payload = client.get(f"/api/uploads/{upload_id}").json()
+        payload = client.get(f"/api/uploads/{upload_id}").json()["upload"]
         if payload["status"] in {"ready", "duplicate", "failed"}:
             return payload
         time.sleep(0.15)

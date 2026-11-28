@@ -98,7 +98,7 @@ function elapsed(job) {
               <span class="job-type">{{ job.type }}</span>
               <span v-if="job.plan" class="job-plan">{{ job.plan }}</span>
               <span class="job-state" :class="job.status">
-                {{ job.status === 'failed' ? '失败' : '解析中' }}
+                {{ job.status === 'failed' ? '失败' : job.status === 'queued' ? '排队中' : job.status === 'indexing' ? '索引中' : '解析中' }}
               </span>
             </div>
 

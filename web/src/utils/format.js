@@ -3,9 +3,11 @@
 export function statusLabel(status) {
   return {
     ready: '就绪',
+    queued: '排队中',
     parsing: '解析中',
     indexing: '解析中',
     failed: '失败',
+    duplicate: '已存在',
     pending: '排队中',
   }[status] || status
 }

@@ -434,8 +434,10 @@ export function uploadDocument({
   return request('/api/uploads', { method: 'POST', body: form })
 }
 
-export function fetchUpload(id) {
-  return request(`/api/uploads/${encodeURIComponent(id)}`)
+/** Poll one upload job; the server wraps the record as `{"upload": ...}`. */
+export async function fetchUpload(id) {
+  const data = await request(`/api/uploads/${encodeURIComponent(id)}`)
+  return data.upload || data
 }
 
 // ── agent console (runs) ──
