@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Chunk, Document
-from .fts import scoped_search
+from .fts import dedupe_highlight, scoped_search
 from .sections import read_section
 
 
@@ -56,7 +56,7 @@ def _citation(
         "heading_num": hit.get("heading_num"),
         "heading_path": hit.get("heading_path", ""),
         "chunk_ids": hit.get("chunk_ids", []),
-        "snippet": (hit.get("snippet") or "")[:max_snippet],
+        "snippet": dedupe_highlight((hit.get("snippet") or "")[:max_snippet]),
         "collection": hit.get("collection"),
     }
     citation.update(_page_fields(hit.get("page_start"), hit.get("page_end")))

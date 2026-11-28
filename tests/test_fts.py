@@ -351,3 +351,31 @@ def test_seg_query_keeps_single_cjk_drops_single_ascii():
     assert seg_query("水") == ["水"]
     assert seg_query("A") == []
     assert seg_query("7") == []
+
+
+def test_snippet_collapses_overlapping_highlights():
+    """P2-1: search-mode subwords must not each get their own <b>.
+
+    "熟练掌握" is ORed in as "熟练", "掌握" and itself, and FTS5 highlights
+    every one; the snippet must read as one highlight per real word.
+    """
+    from app.index.fts import dedupe_highlight
+
+    snippet = (
+        "不 <b>要求</b> <b>熟练</b> <b>掌握</b> <b>熟练掌握</b> "
+        "<b>某种</b> <b>编程</b> <b>语言</b> <b>编程语言</b>"
+    )
+    fixed = dedupe_highlight(snippet)
+    assert "<b>熟练掌握</b>" in fixed
+    assert "<b>编程语言</b>" in fixed
+    assert "<b>熟练</b>" not in fixed
+    assert "<b>掌握</b>" not in fixed
+    assert "<b>编程</b>" not in fixed
+    # A term that is not a prefix of a longer one is kept.
+    assert "<b>要求</b>" in fixed
+
+
+def test_snippet_without_highlight_is_unchanged():
+    from app.index.fts import dedupe_highlight
+
+    assert dedupe_highlight("纯文本，无高亮") == "纯文本，无高亮"

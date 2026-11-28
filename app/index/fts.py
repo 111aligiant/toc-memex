@@ -246,6 +246,51 @@ async def index_document(db: AsyncSession, doc: Document, chunks: list[Chunk]) -
     await index_doc_row(db, doc)
 
 
+_HIGHLIGHT_RUN_RE = re.compile(r"(?:<b>[^<]*</b>(?:\s+|$))+")
+_HIGHLIGHT_TERM_RE = re.compile(r"<b>([^<]*)</b>")
+
+
+def dedupe_highlight(snippet: str) -> str:
+    """Drop overlapping highlights FTS5 emits for one matched word.
+
+    ``build_match`` ORs every search-mode subword of the query
+    ("熟练掌握" contributes "熟练", "掌握", "熟练掌握"), and ``snippet()``
+    wraps each token it matched. Because indexing joins tokens with spaces,
+    the result reads "不 <b>要求</b> <b>熟练</b> <b>掌握</b> <b>熟练掌握</b>…".
+
+    Within each run of adjacent highlights, if a consecutive group of short
+    terms concatenates to exactly one longer term in the same run, drop the
+    short ones. "要求" is kept: it is not a prefix of any longer term.
+    """
+    if "<b>" not in (snippet or ""):
+        return snippet
+
+    def _fix_run(match: re.Match) -> str:
+        run = match.group(0)
+        terms = _HIGHLIGHT_TERM_RE.findall(run)
+        if len(terms) < 2:
+            return run
+        drop: set[int] = set()
+        for i in range(len(terms)):
+            for j in range(i + 2, len(terms) + 1):
+                joined = "".join(terms[i:j])
+                if joined in terms and joined not in terms[i:j]:
+                    # terms[i:j] is the short pieces of a longer term that
+                    # also appears in this run: they are redundant.
+                    drop.update(range(i, j))
+        if not drop:
+            return run
+        kept = [
+            f"<b>{term}</b>"
+            for index, term in enumerate(terms)
+            if index not in drop
+        ]
+        trailing = run[len(run.rstrip()):]
+        return " ".join(kept) + trailing
+
+    return _HIGHLIGHT_RUN_RE.sub(_fix_run, snippet)
+
+
 def _row_to_hit(row, match_type: str) -> dict:
     """Shape a SQL row into a section-first citation result."""
     page_start = row.get("page_start")
@@ -268,7 +313,7 @@ def _row_to_hit(row, match_type: str) -> dict:
         "page_end": page_end,
         "chunk_page_start": chunk_page_start,
         "chunk_page_end": chunk_page_end,
-        "snippet": row.get("snippet") or "",
+        "snippet": dedupe_highlight(row.get("snippet") or ""),
         "score": float(row.get("score") or 0.0),
         "match_type": match_type,
     }
