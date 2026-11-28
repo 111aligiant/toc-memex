@@ -572,10 +572,11 @@ async def upsert_ingest_note(
 
     One per document: a second write edits the existing row instead of
     appending another note, so the library list has a single value to show
-    and edit. When the author changes — an agent ingesting a file after a
-    human wrote the note — the previous body is kept as a ``NoteRevision``
-    before the new text lands, so "who wrote what" survives. Same-author
-    edits overwrite in place, which is what the web editor relies on.
+    and edit. Every overwrite first keeps the replaced body as a
+    ``NoteRevision``. That is unconditional on purpose: the writer's name is
+    self-declared (an MCP handshake name, unverified), so a "same author,
+    overwrite in place" shortcut would let a caller erase another writer's
+    text by claiming their name.
     """
     text = (body or "").strip()
     row = await ingest_note(db, doc_id)
@@ -592,9 +593,8 @@ async def upsert_ingest_note(
             session_id=session_id,
         )
         db.add(row)
-    elif row.author != author:
-        # Preserve the previous author's text as revision 1 before replacing
-        # it. Materialise rev 1 from the current body if no chain exists yet.
+    elif row.body != text:
+        # Materialise rev 1 from the current body if no chain exists yet.
         existing_revs = (
             (
                 await db.execute(
@@ -625,7 +625,9 @@ async def upsert_ingest_note(
                 rev=rev,
                 body=text,
                 author=author,
-                reason="入库备注改由 " + author + " 维护",
+                reason=None
+                if row.author == author
+                else "入库备注改由 " + author + " 维护",
                 created_at=utcnow_iso(),
             )
         )
@@ -634,11 +636,12 @@ async def upsert_ingest_note(
         row.current_rev = rev
         row.revised_at = utcnow_iso()
         row.revised_by = author
-        row.session_id = session_id or row.session_id
-    else:
-        row.body = text
-        if session_id:
-            row.session_id = session_id
+        # The session belongs to the writer of the current body; carrying the
+        # previous writer's stamp over would misattribute the text.
+        row.session_id = session_id
+    elif session_id:
+        # Same text, but a new connection touched it: record who.
+        row.session_id = session_id
     await db.flush()
     return row
 

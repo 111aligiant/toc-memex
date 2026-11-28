@@ -376,6 +376,61 @@ async def test_ingest_note_is_agent_readable_but_not_writable(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_ingest_note_overwrite_always_keeps_a_revision(tmp_path):
+    """A writer claiming the current author's name must not erase history.
+
+    The author on the MCP path is a self-declared handshake name, so "same
+    author, overwrite in place" was an eraser: an agent could pass
+    ``--actor human`` and replace the human's 备注 with no revision. Every
+    overwrite now snapshots the replaced body, and the session stamp
+    describes the writer of the current body rather than a carried-over one.
+    """
+    from sqlalchemy import select
+
+    from app.index.activity import ingest_note, upsert_ingest_note
+    from app.models import NoteRevision
+
+    engine = await _seed(tmp_path)
+    async with session_factory(engine)() as db:
+        first = await upsert_ingest_note(db, "d1", "人类写的初始备注", author="human")
+        await db.commit()
+        note_id = first.id
+
+        second = await upsert_ingest_note(
+            db, "d1", "冒名覆盖的备注", author="human", session_id="sess-agent"
+        )
+        await db.commit()
+        assert second.id == note_id
+        assert second.body == "冒名覆盖的备注"
+        assert second.current_rev == 2
+        assert second.session_id == "sess-agent"
+
+        revs = (
+            (
+                await db.execute(
+                    select(NoteRevision)
+                    .where(NoteRevision.note_id == note_id)
+                    .order_by(NoteRevision.rev)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(rev.rev, rev.author, rev.body) for rev in revs] == [
+            (1, "human", "人类写的初始备注"),
+            (2, "human", "冒名覆盖的备注"),
+        ]
+
+        # A later writer with no server session must not inherit the old one.
+        third = await upsert_ingest_note(db, "d1", "网页上编辑的备注", author="human")
+        await db.commit()
+        assert third.session_id is None
+        assert third.current_rev == 3
+        assert (await ingest_note(db, "d1")).body == "网页上编辑的备注"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_add_note_rejects_dangling_chunk_and_node(tmp_path, monkeypatch):
     """A note on a non-existent anchor is refused, not silently stored.
 
