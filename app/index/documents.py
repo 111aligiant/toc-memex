@@ -50,6 +50,15 @@ def _node_dict(node: TocNode) -> dict[str, Any]:
         "heading_path": node.heading_path,
         "page_start": node.page_start,
         "page_end": node.page_end,
+        # Agent-facing 1-based PDF pages, alongside the 0-based internal
+        # values. search/read_section already expose both; a TOC that only
+        # offered page_start made an agent cite one page early.
+        "pdf_page_start": node.page_start + 1
+        if isinstance(node.page_start, int)
+        else None,
+        "pdf_page_end": node.page_end + 1
+        if isinstance(node.page_end, int)
+        else None,
         "chunk_start": node.chunk_start,
         "chunk_end": node.chunk_end,
         "summary": node.summary,
@@ -352,9 +361,27 @@ async def get_toc(
     ]
     roots.sort(key=_node_sort_key)
 
+    ingest_note = (
+        (
+            await db.execute(
+                select(AgentNote)
+                .where(AgentNote.doc_id == doc_id, AgentNote.kind == "ingest")
+                .order_by(AgentNote.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
     return {
         "doc_id": doc_id,
         "title": doc.title,
+        # Status and parse plan let an agent verify "did this ingest?" and
+        # "how was it parsed?" without a second get_document call.
+        "status": doc.status,
+        "parse_plan": doc.parse_plan,
+        "ingest_note_id": ingest_note.id if ingest_note is not None else None,
         "depth": depth,
         "collection": (await collections_by_doc(db, [doc_id])).get(doc_id),
         "roots": [build(root, 1) for root in roots],

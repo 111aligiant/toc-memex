@@ -176,6 +176,30 @@ async def test_get_toc_depth(tmp_path):
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_get_toc_reports_status_and_pdf_pages(tmp_path):
+    """An agent verifies an ingest from get_toc alone: status, parse plan,
+    and 1-based pdf pages next to the 0-based internal ones."""
+    engine = await _seed(tmp_path)
+    Session = session_factory(engine)
+
+    async with Session() as db:
+        doc = await db.get(Document, "d1")
+        doc.parse_plan = "PDF 文本层"
+        await db.commit()
+        toc = await get_toc(db, "d1", depth=1)
+
+    assert toc["status"] == "ready"
+    assert toc["parse_plan"] == "PDF 文本层"
+    assert "ingest_note_id" in toc
+    root = toc["roots"][0]
+    assert root["page_start"] == 1  # 0-based internal
+    assert root["pdf_page_start"] == 2  # 1-based, what the agent cites
+    assert root["pdf_page_end"] == 3
+
+    await engine.dispose()
+
+
 def test_mcp_server_registers_tools():
     from app.mcp_server import server
 
