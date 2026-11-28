@@ -78,6 +78,21 @@ class Settings(BaseSettings):
     tocmemex_max_chunk_chars: int = 1200
     tocmemex_chunk_overlap: int = 100
 
+    # ── ingest queue ────────────────────────────────────────────────────
+    # How many ingest child processes may run at once. Claiming is done with
+    # a conditional UPDATE on the ``ingest_jobs`` table, so this cap holds
+    # across the web server and any MCP server sharing the database.
+    tocmemex_ingest_concurrency: int = 2
+    # Extra directories an MCP caller may ingest from. The data dir is always
+    # allowed; anything else must be opted into explicitly.
+    tocmemex_ingest_roots: list[Path] = []
+    # Wall-clock cap for one ingest, enforced inside the child so a caller
+    # that vanishes cannot leave a job running forever.
+    tocmemex_ingest_timeout_s: int = 30 * 60
+    # A claimed job whose child stopped heartbeating for this long is
+    # considered dead and is failed at startup.
+    tocmemex_ingest_lease_s: int = 90
+
     # Optional query-term aliases, as JSON: {"term": ["alternative", ...]}.
     # Empty by default; the search layer is generic and knows no domain.
     tocmemex_search_synonyms: dict[str, list[str]] = {}

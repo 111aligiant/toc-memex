@@ -60,6 +60,9 @@ async def _ingest(args) -> int:
     set_engine(engine)
     try:
         force_ocr = getattr(args, "force_ocr", False)
+        job_id = getattr(args, "job_id", None)
+        if job_id:
+            return await _run_job(engine, settings, job_id)
         doc_id = await ingest_path(
             Path(args.path),
             namespace=args.namespace,
@@ -69,11 +72,202 @@ async def _ingest(args) -> int:
             image_mode=getattr(args, "image_mode", "structured"),
             force=getattr(args, "force", False) or force_ocr,
             force_ocr=force_ocr,
+            title=getattr(args, "title", None),
         )
         print(doc_id)
         return 0
     finally:
         await engine.dispose()
+
+
+async def _run_job(engine, settings, job_id: str) -> int:
+    """Run one durable ingest job end to end, then drain the queue.
+
+    Called by the child process the ingest job layer spawns. Doing the
+    post-processing here (collection, ingest note, near-duplicate hint) —
+    rather than in the parent — is what makes the result survive a parent
+    that exits: an MCP client connects per call, so the parent may be gone
+    before OCR finishes.
+    """
+    from .index import activity as activity_mod
+    from .index import collections as collections_mod
+    from .index import similarity
+    from .ingest import jobs as jobs_mod
+    from .ingest.validate import friendly_ingest_error
+    from .models import Document, IngestJob
+
+    try:
+        async with session_factory(engine)() as db:
+            job = await db.get(IngestJob, job_id)
+            if job is None:
+                return 1
+            # Snapshot the fields we need; the session closes below.
+            image_mode = job.image_mode
+            collection_id = job.collection_id
+            ingest_note = job.ingest_note or ""
+            actor = job.actor or "human"
+            session_id = job.session_id
+            namespace = job.namespace or "shared"
+            title = job.title
+            doc_type = job.doc_type
+            doc_date = job.doc_date
+            file_path = job.file_path
+            prior_message = job.message or ""
+    except Exception:
+        return 1
+
+    timeout_s = float(getattr(settings, "tocmemex_ingest_timeout_s", 1800) or 1800)
+    try:
+        doc_id, parsed = await asyncio.wait_for(
+            _ingest_with_heartbeat(
+                engine, jobs_mod, Path(file_path), namespace, doc_type, doc_date,
+                settings, image_mode, title, job_id,
+            ),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        await jobs_mod.finish_job(
+            engine,
+            job_id,
+            status="failed",
+            error=f"解析超时（超过 {int(timeout_s // 60)} 分钟未完成）",
+        )
+        await jobs_mod.pump(engine)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        await jobs_mod.finish_job(
+            engine, job_id, status="failed", error=friendly_ingest_error(str(exc))
+        )
+        await jobs_mod.pump(engine)
+        return 1
+
+    # ── post-processing: collection, ingest note, near-duplicate hint ──
+    try:
+        async with session_factory(engine)() as db:
+            doc = await db.get(Document, doc_id)
+            if doc is None:
+                raise RuntimeError("入库后找不到文档")
+            message = prior_message
+            if collection_id and doc.collection_id is None:
+                try:
+                    await collections_mod.assign_documents(db, [doc_id], collection_id)
+                    await db.commit()
+                except ValueError as exc:
+                    await db.rollback()
+                    message = (message + "；" if message else "") + f"分区不存在：{exc}"
+            if parsed and ingest_note.strip():
+                await activity_mod.upsert_ingest_note(
+                    db, doc_id, ingest_note, author=actor, session_id=session_id
+                )
+                await db.commit()
+            # Near-duplicate hint: best effort, never blocks the job.
+            similar: list[dict] = []
+            try:
+                await similarity.ensure_fingerprint(db, doc)
+                similar = await _similar_for(db, doc, similarity)
+                # Commit before the terminal job write, which opens its own
+                # connection: an uncommitted fingerprint here would hold the
+                # SQLite write lock and make that write fail as "locked".
+                await db.commit()
+            except Exception:
+                await db.rollback()
+            if not parsed:
+                message = message or "库中已有相同文件，未重复入库"
+        # The session is closed above; write the terminal job state on a
+        # fresh connection so an open SQLite write lock cannot block it.
+        await jobs_mod.finish_job(
+            engine,
+            job_id,
+            status="ready" if parsed else "duplicate",
+            doc_id=doc_id,
+            message=message,
+            similar=similar,
+            post_processed=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await jobs_mod.finish_job(
+            engine, job_id, status="failed", error=friendly_ingest_error(str(exc))
+        )
+        await jobs_mod.pump(engine)
+        return 1
+
+    await jobs_mod.pump(engine)
+    print(doc_id)
+    return 0
+
+
+async def _ingest_with_heartbeat(
+    engine, jobs_mod, path, namespace, doc_type, doc_date, settings,
+    image_mode, title, job_id,
+):
+    """Run the parse while a background task keeps the job heartbeat fresh."""
+    from .ingest.pipeline import ingest_path_result
+
+    async def _beat() -> None:
+        while True:
+            await asyncio.sleep(10)
+            try:
+                await jobs_mod.heartbeat(engine, job_id)
+            except Exception:
+                pass
+
+    beat = asyncio.create_task(_beat())
+    try:
+        return await ingest_path_result(
+            path,
+            namespace=namespace,
+            doc_type=doc_type,
+            doc_date=doc_date,
+            settings=settings,
+            image_mode=image_mode,
+            title=title,
+        )
+    finally:
+        beat.cancel()
+        try:
+            await beat
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _similar_for(db, doc, similarity) -> list[dict]:
+    from sqlalchemy import select
+
+    from .models import Document
+
+    candidates = (
+        (
+            await db.execute(
+                select(Document)
+                .where(
+                    Document.namespace_id == doc.namespace_id,
+                    Document.id != doc.id,
+                    Document.status == "ready",
+                )
+                .order_by(Document.updated_at.desc())
+                .limit(200)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Candidates ingested before the column existed may lack a fingerprint;
+    # fill those we are about to compare so the hint is not silently empty.
+    for row in candidates:
+        if not row.simhash:
+            try:
+                await similarity.ensure_fingerprint(db, row)
+            except Exception:
+                pass
+    return similarity.similar_to(
+        title=doc.title,
+        body=await similarity.body_head(db, doc.id),
+        simhash=doc.simhash,
+        candidates=[
+            {"doc_id": row.id, "title": row.title, "simhash": row.simhash}
+            for row in candidates
+        ],
+    )
 
 
 async def _stats(args=None) -> int:
@@ -752,6 +946,16 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument("--namespace", default="shared")
     ingest.add_argument("--type", default=None)
     ingest.add_argument("--date", default=None)
+    # A caller-supplied title overrides the filename stem (PDF metadata is
+    # often empty and a filename is a poor title for screenshots).
+    ingest.add_argument("--title", default=None)
+    # Recorded as the 入库备注 author. Web and CLI default to "human"; the
+    # MCP surface passes the agent's self-reported name.
+    ingest.add_argument("--actor", default="human")
+    # Set by the ingest job layer: run the whole job (parse + collection +
+    # note + near-duplicate hint) and write its terminal state, then drain
+    # the queue. Not meant to be typed by a human.
+    ingest.add_argument("--job-id", default=None, help=argparse.SUPPRESS)
     # Images only: "structured" builds a TOC/figures, "text" keeps one flat
     # searchable text document. Non-image files ignore it.
     ingest.add_argument(

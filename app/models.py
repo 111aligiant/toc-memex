@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     LargeBinary,
@@ -680,3 +681,79 @@ class Collection(Base):
         """
         self.name_key = (value or "").strip().casefold()
         return value
+
+class IngestJob(Base):
+    """One ingest request, durable across restarts and shared by Web and MCP.
+
+    The web upload endpoint used to keep progress in ``app.state.uploads``
+    (memory only), so a restart lost the record while the document could
+    still be ``ready``. The MCP server had no ingest entry point at all and
+    had to shell out to REST/CLI, which lost the caller's identity. Both now
+    create a row here, and the child process that does the parsing writes
+    the terminal state itself — so a caller that dies (an stdio MCP client
+    disconnects per call) cannot lose the job.
+
+    Status vocabulary, shared with the document row:
+    ``queued → parsing → indexing → ready | failed | duplicate``.
+    """
+
+    __tablename__ = "ingest_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", index=True)
+    stage: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    progress: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    collection_id: Mapped[str | None] = mapped_column(
+        ForeignKey("collections.id", ondelete="SET NULL"), nullable=True
+    )
+    image_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="structured")
+    ingest_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Ingest inputs echoed so a job stays describable (and retryable) after
+    # a restart. ``namespace`` is required: exact dedupe is
+    # (namespace_id, content_hash), not content_hash alone.
+    namespace: Mapped[str] = mapped_column(String(64), nullable=False, default="shared")
+    title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    doc_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    doc_date: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    doc_id: Mapped[str | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    # Who asked. ``actor`` is self-declared (an MCP handshake name) and
+    # unverified; ``session_id`` is server-assigned per connection, so the
+    # pair says "this job was requested by X on connection Y". Web/CLI
+    # default to "human".
+    actor: Mapped[str] = mapped_column(String(80), nullable=False, default="human")
+    session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="web")
+
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    similar_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Restart recovery: ``child_pid`` + ``heartbeat_at`` separate "the child
+    # is still alive in another process" from "it died", and
+    # ``post_processed_at`` keeps the collection/note/similar step idempotent
+    # if the child crashes after the document is ready but before the job's
+    # terminal write.
+    child_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    heartbeat_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    finished_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    post_processed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utcnow_iso)
+    updated_at: Mapped[str] = mapped_column(
+        String(40), nullable=False, default=utcnow_iso, onupdate=utcnow_iso
+    )
+
+    __table_args__ = (
+        Index("ix_ingest_jobs_status_updated", "status", "updated_at"),
+    )
