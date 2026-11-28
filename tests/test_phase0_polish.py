@@ -132,19 +132,20 @@ async def test_scoped_search_distinct_docs_none_keeps_all(tmp_path):
 
 
 def test_ingest_path_normalizes_relative_path():
-    """ingest_path resolves its input so ``file_path`` is stored absolute.
+    """ingest resolves its input so ``file_path`` is stored absolute.
 
     mcp-feedback §4.4: old rows stored relative ``data\\uploads\\...`` paths,
     new rows absolute, and an agent cannot reliably parse either. The fix is
-    one line in ``ingest_path`` — ``path = Path(path).resolve()`` — and this
-    test pins it so a future refactor cannot silently re-relative the stored
-    path.
+    one line in the ingest entry point — ``path = Path(path).resolve()`` —
+    and this test pins it so a future refactor cannot silently re-relative
+    the stored path. ``ingest_path`` delegates to ``ingest_path_result``, so
+    the check follows the implementation there.
     """
     import inspect
 
     from app.ingest import pipeline
 
-    src = inspect.getsource(pipeline.ingest_path)
+    src = inspect.getsource(pipeline.ingest_path_result)
     assert "Path(path).resolve()" in src
     # The normalization happens before the DB row is written.
     assert src.index("Path(path).resolve()") < src.index("_open_ingest_row")

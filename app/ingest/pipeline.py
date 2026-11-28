@@ -1192,6 +1192,9 @@ async def _set_doc_state(engine: AsyncEngine, doc_id: str, **fields) -> None:
 
     Ingest runs in a child process; the queue endpoint is read by the web
     process, so a stage update only becomes visible once it is committed.
+    The same commit also refreshes the ``ingest_jobs`` heartbeat: the child
+    is the only writer of that heartbeat, so a parent that dies cannot make
+    a dead child look alive.
     """
     async with session_factory(engine)() as db:
         doc = await db.get(Document, doc_id)
@@ -1200,6 +1203,21 @@ async def _set_doc_state(engine: AsyncEngine, doc_id: str, **fields) -> None:
         for key, value in fields.items():
             setattr(doc, key, value)
         doc.updated_at = utcnow_iso()
+        now = utcnow_iso()
+        # The job for this document is still active (its doc_id is only
+        # written at the end), so match by content_hash. The child also
+        # heartbeats on its own; this keeps the two in step at stage
+        # boundaries.
+        await db.execute(
+            text(
+                "UPDATE ingest_jobs SET heartbeat_at = :now, updated_at = :now "
+                "WHERE status IN ('parsing','indexing') "
+                "AND id = (SELECT id FROM ingest_jobs WHERE content_hash = :hash "
+                "          AND status IN ('parsing','indexing') "
+                "          ORDER BY created_at DESC LIMIT 1)"
+            ),
+            {"now": now, "hash": doc.content_hash},
+        )
         await db.commit()
 
 
@@ -1258,6 +1276,7 @@ async def _open_ingest_row(
     plan: str,
     *,
     force: bool = False,
+    title: str | None = None,
 ) -> tuple[str, bool]:
     """Create the documents row before parsing starts.
 
@@ -1291,7 +1310,7 @@ async def _open_ingest_row(
             existing.stage = "准备解析"
             existing.progress = 5
             existing.parse_plan = plan
-            existing.title = path.stem
+            existing.title = title or path.stem
             existing.filename = path.name
             existing.file_path = str(path)
             existing.doc_type = doc_type or infer_doc_type(path)
@@ -1311,7 +1330,7 @@ async def _open_ingest_row(
         doc = Document(
             id=new_uuid(),
             namespace_id=namespace,
-            title=path.stem,
+            title=title or path.stem,
             filename=path.name,
             file_path=str(path),
             content_hash=content_hash,
@@ -1453,9 +1472,49 @@ async def ingest_path(
     image_mode: str = "structured",
     force: bool = False,
     force_ocr: bool = False,
+    title: str | None = None,
 ) -> str:
     """Ingest one file. ``force`` re-parses an already-ingested file in
-    place; ``force_ocr`` additionally skips direct text extraction."""
+    place; ``force_ocr`` additionally skips direct text extraction.
+
+    Returns the document id. Callers that need to know whether this run
+    actually parsed (vs. finding the same bytes already present) should use
+    :func:`ingest_path_result` instead.
+    """
+    doc_id, _parsed = await ingest_path_result(
+        path,
+        namespace=namespace,
+        doc_type=doc_type,
+        doc_date=doc_date,
+        ocr_client=ocr_client,
+        settings=settings,
+        image_mode=image_mode,
+        force=force,
+        force_ocr=force_ocr,
+        title=title,
+    )
+    return doc_id
+
+
+async def ingest_path_result(
+    path: Path,
+    namespace: str = "shared",
+    doc_type: str | None = None,
+    doc_date: str | None = None,
+    ocr_client: BaseOcrProvider | None = None,
+    settings: Settings | None = None,
+    image_mode: str = "structured",
+    force: bool = False,
+    force_ocr: bool = False,
+    title: str | None = None,
+) -> tuple[str, bool]:
+    """Ingest one file, returning ``(doc_id, parsed)``.
+
+    ``parsed`` is False when the same bytes were already present (ready or
+    in flight) in this namespace and nothing was re-parsed. A concurrent
+    ingest of the same bytes also reports False, so a job can record
+    ``duplicate`` instead of claiming a parse it did not do.
+    """
     settings = settings or get_settings()
     path = Path(path).resolve()
     suffix = path.suffix.lower()
@@ -1472,9 +1531,10 @@ async def ingest_path(
         content_hash,
         guess_parse_plan(path, image_mode),
         force=force,
+        title=title,
     )
     if not should_parse:
-        return doc_id
+        return doc_id, False
 
     ocr_settings = (
         await _resolve_ocr_settings(settings)
@@ -1569,4 +1629,4 @@ async def ingest_path(
         logger.exception("ingest persist failed for %s", doc_id)
         await _mark_ingest_failed(engine, doc_id, exc)
         raise
-    return doc_id
+    return doc_id, True
