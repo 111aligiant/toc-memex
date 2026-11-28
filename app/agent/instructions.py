@@ -89,7 +89,7 @@ FULL_INSTRUCTIONS = " ".join(
     ]
 )
 
-# Guidance for the 8-tool default surface. It may only name tools the
+# Guidance for the 14-tool default surface. It may only name tools the
 # default profile exposes (tests/test_tool_profiles.py enforces this).
 DEFAULT_CORE = (
     "Start with memex_overview() to see what the library holds: document "
@@ -110,8 +110,20 @@ DEFAULT_CORE = (
 )
 
 DEFAULT_LIBRARY = (
+    "Ingest: when asked to add files, call ingest_path(path, "
+    "collection_id=..., ingest_note=...) or ingest_paths(paths=[...]); it "
+    "returns a job id at once because OCR takes minutes. Poll "
+    "get_ingest(job_id) until status is ready, failed or duplicate — on "
+    "ready, similar_documents lists near-duplicates already in the library "
+    "(duplicate_hint marks a strong match), so check it before adding a "
+    "file that may already be there. The ingest note is recorded with you "
+    "as its author. To verify an ingest, use list_documents() and "
+    "get_document(doc_id) — status, parse_plan and ingest_note.author "
+    "answer whether it landed and how it was parsed. "
     "Library loop: leave a hand-off with add_note(kind='handoff', ...) so "
-    "the next agent inherits your context. If a section is wrong, file it "
+    "the next agent inherits your context; correct a note you got wrong "
+    "with note_update(note_id, body, reason) — it appends a revision and "
+    "keeps the old text. If a section is wrong, file it "
     "with activity_write(kind='erratum', doc_id=..., node_id=...) "
     "describing the error; a second agent confirms or rejects it with "
     "activity_write(kind='review', accepts=true/false). Responses may "

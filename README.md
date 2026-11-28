@@ -53,6 +53,10 @@ Web 端上传同样可用：选文件、填入库备注，解析队列分阶段�
 
 Toc Memex 不替 agent 做判断，只提供带地址的工具面。外部 agent 经 MCP 连入后，握手时自报的 `client_info.name` 记为作者，服务端为连接分配 `session_id`，每次调用落一条 `tool_call` / `tool_result`。对一次调用一条连接的客户端（DSH、WorkBuddy 常见），同一客户端 30 分钟内的调用归并为一个「外部 agent 会话」任务，调用不会散成断线记录；`run_start` / `run_end` 可显式划界。
 
+### 入库也是工具
+
+默认工具面（14 个）里就有入库：`ingest_path(path, collection_id=..., ingest_note=...)` 建一个入库任务并立刻返回 job id（OCR 要几分钟，不阻塞调用），`get_ingest(job_id)` 轮询到 `ready` / `failed` / `duplicate`。`ingest_paths(paths=[...])` 一次提交多份。任务落 `ingest_jobs` 表，解析在脱离父进程的子进程里完成，所以 MCP 客户端断开、服务重启都不会丢任务；入库备注以调用者为作者记录，`similar_documents` 在入库后提示库里已有的近重复文档。路径限定在数据目录与 `TOCMEMEX_INGEST_ROOTS` 内。
+
 ### 一次典型调用
 
 以公开论文 [Attention Is All You Need](https://arxiv.org/abs/1706.03762) 为例，WorkBuddy 与 DSH 可以共用同一份本地馆藏，各自留下可回放的调用与手记：

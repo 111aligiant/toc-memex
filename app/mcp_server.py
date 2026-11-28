@@ -17,7 +17,7 @@ import functools
 import logging
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -56,17 +56,26 @@ _PROFILES = {PROFILE_DEFAULT, PROFILE_FULL}
 # Warn once per process about an unknown TOCMEMEX_TOOLS value.
 _INVALID_PROFILE_WARNED = False
 
-# The 8-tool surface advertised to external agents by default. Everything
+# The 14-tool surface advertised to external agents by default. Everything
 # else is still implemented and reachable through the ``full`` profile.
+# 2026-11-28: ingest, verification and self-correction joined the default
+# surface — an agent asked to "ingest these files" could not, and had to
+# reach REST/CLI, which lost its identity.
 DEFAULT_TOOLS: frozenset[str] = frozenset({
     "memex_overview",
+    "list_documents",
+    "get_document",
     "search",
     "get_toc",
     "read_section",
     "add_note",
+    "note_update",
     "mark_used",
     "activity_write",
     "propose_ops",
+    "ingest_path",
+    "ingest_paths",
+    "get_ingest",
 })
 
 # (tool name, function, profile required to expose it). Filled while the
@@ -81,12 +90,41 @@ SERVER_DESCRIPTION = (
 # Module-level server: always the complete surface. The built-in console
 # (``app.agent.surface``) and tests call this instance; the outside-facing
 # lifecycle is ``main()``, which starts ``build_server(_active_profile())``.
+@asynccontextmanager
+async def _ingest_lifespan(server: "MCPServer"):
+    """Reconcile stale ingest jobs at startup and drain the queue at exit.
+
+    Without this, an MCP-only deployment (no web server running) would leave
+    a job claimed before the last shutdown in ``parsing`` forever. Errors must
+    not stop the server from starting.
+    """
+    from .ingest import jobs as _jobs
+
+    settings = get_settings()
+    try:
+        cached = await _get_cached_engine(settings.tocmemex_db_path)
+        await _jobs.reconcile_jobs(
+            cached.engine,
+            db_path=settings.tocmemex_db_path,
+            data_dir=settings.tocmemex_data_dir,
+        )
+    except Exception:
+        logger.exception("ingest job reconciliation failed")
+    try:
+        yield
+    finally:
+        # Children are detached and own their rows, so disposing the pool
+        # here cannot interrupt an ingest; it just releases connections.
+        await dispose_cached_engines()
+
+
 server = MCPServer(
     "toc-memex",
     title="Toc Memex",
     description=SERVER_DESCRIPTION,
     instructions=FULL_INSTRUCTIONS,
     version=__version__,
+    lifespan=_ingest_lifespan,
 )
 
 
@@ -125,6 +163,7 @@ def build_server(profile: str) -> MCPServer:
         description=SERVER_DESCRIPTION,
         instructions=instructions_for(profile),
         version=__version__,
+        lifespan=_ingest_lifespan,
     )
     for tool_name, fn, required in _REGISTRY:
         if profile == PROFILE_FULL or required == PROFILE_DEFAULT:
@@ -487,7 +526,7 @@ async def list_collections(ctx: Context | None = None) -> dict:
     return await _with_db(_run)
 
 
-@tool(profile=PROFILE_FULL)
+@tool()
 @observed
 async def list_documents(
     query: str = "",
@@ -505,17 +544,36 @@ async def list_documents(
     )
 
 
-@tool(profile=PROFILE_FULL)
+@tool()
 @observed
 async def get_document(doc_id: str, ctx: Context | None = None) -> dict:
-    """Get document metadata, counts, and top-level TOC roots."""
+    """Get document metadata, counts, and top-level TOC roots.
+
+    Use this to verify an ingest: ``status`` (``ready`` / ``failed`` / …),
+    ``parse_plan`` (how the file was parsed — text layer, OCR, Markdown
+    direct), ``page_count`` / ``char_count``, and ``ingest_note`` (the
+    入库备注 with its ``author``, so you can see who wrote it). ``toc_roots``
+    lists top-level nodes; for the full tree use ``get_toc``.
+    """
     return await _with_db(lambda db: _get_document(db, doc_id))
 
 
 @tool()
 @observed
 async def get_toc(doc_id: str, depth: int = 2, ctx: Context | None = None) -> dict:
-    """Get the TOC tree. depth=2 returns roots and their children."""
+    """Get the TOC tree. depth=2 returns roots and their children.
+
+    Returns ``{"doc_id", "title", "status", "parse_plan", "ingest_note_id",
+    "depth", "collection", "roots"}``. Each root and child is a node:
+    ``{"node_id", "id", "parent_id", "level", "heading_num", "title",
+    "heading_path", "page_start", "page_end", "pdf_page_start",
+    "pdf_page_end", "chunk_start", "chunk_end", "summary", "source",
+    "confidence", "children"}``. Use ``node_id`` with read_section.
+
+    Page fields come in two forms: ``page_start``/``page_end`` are 0-based
+    internal indices; ``pdf_page_start``/``pdf_page_end`` are the 1-based
+    PDF pages you cite. Always cite ``pdf_page_*``.
+    """
     if not (doc_id or "").strip():
         raise ToolError("doc_id 不能为空")
     depth = max(1, min(int(depth or 1), 4))
@@ -527,6 +585,212 @@ async def get_toc(doc_id: str, depth: int = 2, ctx: Context | None = None) -> di
             raise _tool_error(exc) from exc
 
     return await _with_db(_run)
+
+
+# ── ingest ────────────────────────────────────────────────────────────────
+#
+# Ingest is asynchronous on purpose: OCR on one image takes minutes and an
+# MCP client will not hold a call open that long. ``ingest_path`` queues a
+# job and returns immediately; poll ``get_ingest(job_id)`` for the terminal
+# state. The job and its post-processing run in a detached child process, so
+# the result survives this server exiting (a stdio client connects per call).
+
+
+async def _ingest_engine_cached():
+    settings = get_settings()
+    cached = await _get_cached_engine(settings.tocmemex_db_path)
+    return cached.engine
+
+
+def _ingest_actor(ctx: Context | None) -> str:
+    """Who asked: the handshake name, unverified; never a tool argument."""
+    return _client_name(ctx) or "mcp"
+
+
+async def _create_ingest_job(
+    *,
+    path: str,
+    collection_id: str,
+    image_mode: str,
+    doc_type: str,
+    title: str,
+    ingest_note: str,
+    ctx: Context | None,
+) -> dict:
+    from .ingest import jobs as _jobs
+    from .ingest.validate import validate_ingest_file
+
+    settings = get_settings()
+    extra_roots = list(getattr(settings, "tocmemex_ingest_roots", []) or [])
+    resolved = _jobs.resolve_ingest_path(
+        path,
+        data_dir=settings.tocmemex_data_dir,
+        extra_roots=extra_roots,
+        db_path=settings.tocmemex_db_path,
+    )
+    try:
+        validate_ingest_file(resolved)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    engine = await _ingest_engine_cached()
+    job = await _jobs.create_job(
+        engine,
+        file_path=resolved,
+        collection_id=collection_id or None,
+        image_mode=image_mode or "structured",
+        ingest_note=ingest_note or "",
+        actor=_ingest_actor(ctx),
+        session_id=_log_session_id(ctx),
+        source="mcp",
+        doc_type=doc_type or None,
+        title=title or None,
+    )
+    return job
+
+
+@tool()
+@observed
+async def ingest_path(
+    path: str,
+    collection_id: str = "",
+    image_mode: str = "structured",
+    doc_type: str = "",
+    title: str = "",
+    ingest_note: str = "",
+    wait_seconds: float = 0,
+    ctx: Context | None = None,
+) -> dict:
+    """Ingest one local file into the library. Returns at once with a job.
+
+    ``path`` must be inside the library data dir or a configured ingest root
+    (``TOCMEMEX_INGEST_ROOTS``); a path outside them is refused. The file is
+    read, never moved or deleted.
+
+    Ingest is asynchronous — a screenshot runs OCR for minutes. The returned
+    ``{"job": {...}}`` carries ``id`` and ``status``. Poll
+    ``get_ingest(job_id)`` until ``status`` is ``ready``, ``failed`` or
+    ``duplicate``. Pass ``wait_seconds`` (max 120) to block that long for a
+    terminal state in this call.
+
+    ``collection_id`` files the document into a topic; ``ingest_note`` is
+    the 入库备注 and is recorded with *you* as its author. ``doc_type`` and
+    ``title`` override the values inferred from the file. ``image_mode`` is
+    ``structured`` (build a TOC) or ``text`` (one flat document), images
+    only.
+    """
+    from .ingest import jobs as _jobs
+
+    job = await _create_ingest_job(
+        path=path,
+        collection_id=collection_id,
+        image_mode=image_mode,
+        doc_type=doc_type,
+        title=title,
+        ingest_note=ingest_note,
+        ctx=ctx,
+    )
+    engine = await _ingest_engine_cached()
+    await _jobs.pump(engine)
+    if wait_seconds and wait_seconds > 0:
+        return {"job": await _wait_for_job(engine, job["id"], wait_seconds)}
+    return {"job": await _jobs.get_job(engine, job["id"]) or job}
+
+
+@tool()
+@observed
+async def ingest_paths(
+    paths: list[str],
+    collection_id: str = "",
+    image_mode: str = "structured",
+    doc_type: str = "",
+    title: str = "",
+    ingest_note: str = "",
+    ctx: Context | None = None,
+) -> dict:
+    """Ingest several local files at once. Returns ``{"jobs": [...]}``.
+
+    Each path is validated and queued independently: one bad path fails its
+    own entry and does not block the rest. Concurrency is capped by
+    ``TOCMEMEX_INGEST_CONCURRENCY``; extra jobs stay ``queued`` and start as
+    earlier ones finish. Poll each job with ``get_ingest``.
+    """
+    from .ingest import jobs as _jobs
+
+    paths = list(paths or [])
+    if not paths:
+        raise ToolError("paths 不能为空")
+    if len(paths) > 50:
+        raise ToolError("一次最多入库 50 个文件，请分批调用")
+
+    created: list[dict] = []
+    errors: list[dict] = []
+    for raw in paths:
+        try:
+            job = await _create_ingest_job(
+                path=raw,
+                collection_id=collection_id,
+                image_mode=image_mode,
+                doc_type=doc_type,
+                title=title,
+                ingest_note=ingest_note,
+                ctx=ctx,
+            )
+            created.append(job)
+        except ToolError as exc:
+            errors.append({"path": raw, "error": str(exc)})
+    engine = await _ingest_engine_cached()
+    await _jobs.pump(engine)
+    jobs_out = []
+    for job in created:
+        jobs_out.append(await _jobs.get_job(engine, job["id"]) or job)
+    return {"jobs": jobs_out, "errors": errors}
+
+
+# Deliberately NOT decorated with ``@observed``: the wrapper's CallGuard
+# caches successful dict results, so a repeated poll of the same job_id would
+# return the stale ``queued`` payload and the poll would never advance.
+@tool()
+async def get_ingest(job_id: str, ctx: Context | None = None) -> dict:
+    """Poll an ingest job by id. Returns ``{"job": {...}}``.
+
+    ``status`` is one of ``queued`` (waiting for a slot), ``parsing`` /
+    ``indexing`` (running), or the terminal ``ready`` / ``failed`` /
+    ``duplicate``. While running, ``stage`` and ``progress`` say what is
+    happening. On ``ready`` the payload carries ``doc_id`` (read it with
+    ``get_document``) and ``similar_documents`` — near-duplicates already in
+    the library, with ``duplicate_hint`` true for a strong match. On
+    ``failed``, ``error`` is a readable reason. An unknown id returns
+    ``{"job": None, "hint": ...}`` rather than raising.
+    """
+    from .ingest import jobs as _jobs
+
+    if not (job_id or "").strip():
+        raise ToolError("job_id 不能为空")
+    engine = await _ingest_engine_cached()
+    job = await _jobs.get_job(engine, job_id)
+    if job is None:
+        return {
+            "job": None,
+            "hint": "没有这个入库任务。任务 id 来自 ingest_path 的返回；"
+            "服务重启后任务仍在库中，请核对 id。",
+        }
+    return {"job": job}
+
+
+async def _wait_for_job(engine: Any, job_id: str, wait_seconds: float) -> dict:
+    """Block up to ``wait_seconds`` for a terminal state, then return anyway."""
+    import asyncio as _asyncio
+
+    from .ingest import jobs as _jobs
+
+    deadline = _asyncio.get_running_loop().time() + min(float(wait_seconds), 120.0)
+    job = await _jobs.get_job(engine, job_id)
+    while job is not None and job["status"] not in _jobs.TERMINAL_STATUSES:
+        if _asyncio.get_running_loop().time() >= deadline:
+            break
+        await _asyncio.sleep(1.0)
+        job = await _jobs.get_job(engine, job_id)
+    return job or {}
 
 
 @tool()
@@ -1317,7 +1581,7 @@ async def delete_note(
         return {"deleted": result.rowcount}
 
 
-@tool(profile=PROFILE_FULL)
+@tool()
 @observed
 async def note_update(
     note_id: int,
@@ -1612,6 +1876,66 @@ async def get_chunks(doc_id: str, node_id: str = "", limit: int = 100, offset: i
     return await _curation_call(
         doc_id, "get_chunks", {"node_id": node_id, "limit": limit, "offset": offset}
     )
+
+
+@tool(profile=PROFILE_FULL)
+@observed
+async def find_similar(doc_id: str, ctx: Context | None = None) -> dict:
+    """Find near-duplicates of a document already in the library.
+
+    Returns ``{"doc_id", "similar": [...], "duplicate_hint"}``. A match is
+    either the same document designation (a strong match) or a close SimHash
+    (the same content with different bytes — e.g. a re-taken screenshot).
+    Use it before ingesting a file you suspect is already present.
+    """
+    from sqlalchemy import select
+
+    from .index import similarity as _similarity
+    from .models import Document
+
+    async def _run(db: AsyncSession) -> dict:
+        doc = await db.get(Document, doc_id)
+        if doc is None:
+            raise ToolError(f"文档不存在：{doc_id}")
+        await _similarity.ensure_fingerprint(db, doc)
+        candidates = (
+            (
+                await db.execute(
+                    select(Document)
+                    .where(
+                        Document.namespace_id == doc.namespace_id,
+                        Document.id != doc.id,
+                        Document.status == "ready",
+                    )
+                    .order_by(Document.updated_at.desc())
+                    .limit(200)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for row in candidates:
+            if not row.simhash:
+                try:
+                    await _similarity.ensure_fingerprint(db, row)
+                except Exception:
+                    pass
+        similar = _similarity.similar_to(
+            title=doc.title,
+            body=await _similarity.body_head(db, doc.id),
+            simhash=doc.simhash,
+            candidates=[
+                {"doc_id": row.id, "title": row.title, "simhash": row.simhash}
+                for row in candidates
+            ],
+        )
+        return {
+            "doc_id": doc.id,
+            "similar": similar,
+            "duplicate_hint": any(item["strong"] for item in similar),
+        }
+
+    return await _with_db(_run)
 
 
 @tool(profile=PROFILE_FULL)
