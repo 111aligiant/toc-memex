@@ -1,0 +1,1 @@
+import{_ as n,r as u}from"./index-CeTukFWK.js";const l=n("upload",()=>{const e=u(null);function t(r){e.value=r}function o(){const r=e.value;return e.value=null,r}return{retry:e,setRetry:t,consumeRetry:o}});export{l as u};
