@@ -31,6 +31,17 @@ class PaddleOcrError(OcrProviderError):
     pass
 
 
+def _retry_after_seconds(response: httpx.Response, default: float = 60.0) -> float:
+    """The server's Retry-After, in seconds, or a conservative default."""
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
 class PaddleOcrProvider(BaseOcrProvider):
     name = "paddle"
 
@@ -61,8 +72,17 @@ class PaddleOcrProvider(BaseOcrProvider):
             "model": self.settings.paddleocr_api_model,
             "optionalPayload": _OPTIONAL_PAYLOAD,
         }
+        # The vendor's submit endpoint returns transient 5xx errors under
+        # load. The old budget (3 tries, 2s + 4s) gave up after ~6 seconds,
+        # so a 20-second outage always failed and the user paid for a full
+        # OCR run again. Back off up to 60s between tries instead; 429 gets
+        # its own, longer treatment because it means "slow down", not "retry
+        # immediately".
+        backoff = (2, 4, 8, 16, 32)
+        max_delay = 60
         last: Exception | None = None
-        for attempt in range(3):
+        attempt = 0
+        while True:
             response: httpx.Response | None = None
             try:
                 await self._guard_url(self.settings.paddleocr_api_url)
@@ -82,7 +102,22 @@ class PaddleOcrProvider(BaseOcrProvider):
                     if not job_id:
                         raise PaddleOcrError("submit response missing data.jobId")
                     return str(job_id)
+                if response.status_code == 429:
+                    # Rate limited: honour Retry-After when the vendor sends
+                    # one, otherwise wait a full minute before trying again.
+                    retry_after = _retry_after_seconds(response)
+                    last = PaddleOcrError(
+                        f"submit failed HTTP 429: {response.text[:200]}"
+                    )
+                    if attempt >= len(backoff):
+                        raise PaddleOcrError(
+                            f"submit failed after retries: {last}"
+                        )
+                    await self._sleep(min(retry_after, max_delay))
+                    attempt += 1
+                    continue
                 if response.status_code < 500:
+                    # A 4xx other than 429 will not fix itself on retry.
                     raise PaddleOcrError(
                         f"submit failed HTTP {response.status_code}: "
                         f"{response.text[:200]}"
@@ -91,9 +126,10 @@ class PaddleOcrProvider(BaseOcrProvider):
                     f"submit failed HTTP {response.status_code}: "
                     f"{response.text[:200]}"
                 )
-            if attempt < 2:
-                await self._sleep(2 * (attempt + 1))
-        raise PaddleOcrError(f"submit failed after retries: {last}")
+            if attempt >= len(backoff):
+                raise PaddleOcrError(f"submit failed after retries: {last}")
+            await self._sleep(min(backoff[attempt], max_delay))
+            attempt += 1
 
     async def _poll(self, client: httpx.AsyncClient, job_id: str) -> str:
         url = f"{self.settings.paddleocr_api_url.rstrip('/')}/{job_id}"

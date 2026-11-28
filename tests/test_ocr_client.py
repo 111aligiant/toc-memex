@@ -77,3 +77,65 @@ async def test_submit_retries_transient_500(tmp_path, monkeypatch):
 
     assert await client.submit(pdf) == "job-1"
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_submit_survives_a_20_second_500_outage(tmp_path, monkeypatch):
+    """P1-1: the old 6-second budget always failed a 20s outage.
+
+    Five consecutive 500s must still end in a successful submit; the delays
+    are recorded so the test pins the backoff schedule too.
+    """
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 5:
+            return httpx.Response(500, text="server error")
+        return httpx.Response(200, json={"data": {"jobId": "job-2"}})
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("app.ocr.providers.base.asyncio.sleep", fake_sleep)
+    settings = Settings(
+        paddleocr_api_token="t",
+        paddleocr_api_url="https://example.test/jobs",
+    )
+    client = PaddleOcrClient(settings, transport=httpx.MockTransport(handler))
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+
+    assert await client.submit(pdf) == "job-2"
+    assert attempts == 6
+    assert delays == [2, 4, 8, 16, 32]
+
+
+@pytest.mark.asyncio
+async def test_submit_honours_retry_after_on_429(tmp_path, monkeypatch):
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "7"}, text="slow down")
+        return httpx.Response(200, json={"data": {"jobId": "job-3"}})
+
+    async def fake_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("app.ocr.providers.base.asyncio.sleep", fake_sleep)
+    settings = Settings(
+        paddleocr_api_token="t",
+        paddleocr_api_url="https://example.test/jobs",
+    )
+    client = PaddleOcrClient(settings, transport=httpx.MockTransport(handler))
+    pdf = tmp_path / "x.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+
+    assert await client.submit(pdf) == "job-3"
+    assert delays == [7]
