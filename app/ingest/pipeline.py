@@ -1211,6 +1211,30 @@ async def _mark_ingest_failed(engine: AsyncEngine, doc_id: str, exc: Exception) 
         )
     except Exception:
         logger.exception("could not mark document %s failed", doc_id)
+    # Failures used to leave no provenance row, so the upstream message that
+    # explains *why* (an OCR 5xx body, a corrupt-PDF detail) existed only in
+    # the parent's log. Record it on the document's history instead.
+    try:
+        await _record_failure_run(engine, doc_id, exc)
+    except Exception:
+        logger.exception("could not record failed ingest run for %s", doc_id)
+
+
+async def _record_failure_run(
+    engine: AsyncEngine, doc_id: str, exc: Exception
+) -> None:
+    async with session_factory(engine)() as db:
+        doc = await db.get(Document, doc_id)
+        if doc is None:
+            return
+        run = build_run(
+            doc,
+            recorded_by="ingest",
+            status="failed",
+            error=(str(exc) or exc.__class__.__name__)[:4000],
+        )
+        await record_run(db, run)
+        await db.commit()
 
 
 async def _clear_derived_rows(db: AsyncSession, doc_id: str) -> None:

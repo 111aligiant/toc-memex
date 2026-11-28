@@ -860,3 +860,36 @@ def test_prefer_outline_keeps_heuristics_for_a_junky_outline(monkeypatch):
     assert (
         pipeline._prefer_outline_bookmarks(synth, Path("a.pdf")) is synth
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_ingest_records_provenance_row(tmp_path):
+    """A failure must leave an ingest_runs row with the upstream message.
+
+    Before this, a failed parse set documents.error and nothing else, so the
+    vendor's 5xx body existed only in the parent process log.
+    """
+    engine = make_engine(tmp_path / "tocmemex.db")
+    await init_db(engine)
+    set_engine(engine)
+
+    class ExplodingOcr:
+        async def parse_pdf(self, pdf_path, out_dir):
+            raise RuntimeError("job failed (job 42): OCR识别任务失败（状态： 500")
+
+    pdf = tmp_path / "bad.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    with pytest.raises(RuntimeError):
+        await ingest_path(
+            pdf, ocr_client=ExplodingOcr(), settings=settings_for(tmp_path)
+        )
+
+    async with session_factory(engine)() as db:
+        rows = (
+            await db.execute(
+                text("select status, error from ingest_runs order by id")
+            )
+        ).mappings().all()
+    assert rows, "a failed ingest wrote no provenance row"
+    assert rows[-1]["status"] == "failed"
+    assert "500" in (rows[-1]["error"] or "")
