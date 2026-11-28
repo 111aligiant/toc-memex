@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 
 from mcp.server.mcpserver import Context, Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from . import __version__
@@ -45,7 +46,7 @@ from .index.fts import scoped_search
 from .index.overview import overview as _overview
 from .index import resources as _resources
 from .index.sections import read_section as _read_section
-from .models import AgentNote, Document
+from .models import AgentNote, Chunk, Document, TocNode
 
 logger = logging.getLogger(__name__)
 
@@ -1137,6 +1138,8 @@ async def add_note(
     is written by the human at upload time and is read-only for agents.
     Anchor it to a document
     (and optionally node/chunk) or leave doc_id empty for the common area.
+    A node_id or chunk_id that does not belong to doc_id is refused, so a
+    note is never stored on an anchor that reads back as nothing.
     reply_to links this note to the note id it responds to.
     Prefix the body with @author of the note you answer.
 
@@ -1161,6 +1164,29 @@ async def add_note(
     async with _session() as db:
         if doc_id and await db.get(Document, doc_id) is None:
             raise ToolError(f"文档不存在：{doc_id}")
+        if node_id and doc_id:
+            # A note anchored to a node that does not exist reads back as
+            # "lost": the writer thinks it succeeded, the reader never sees
+            # it. Refuse the anchor instead of storing a dangling pointer.
+            exists = (
+                await db.execute(
+                    select(1).where(
+                        TocNode.doc_id == doc_id, TocNode.node_id == node_id
+                    )
+                )
+            ).first()
+            if exists is None:
+                raise ToolError(f"节点不存在：{node_id}（doc {doc_id}）")
+        if chunk_id is not None:
+            if not doc_id:
+                raise ToolError("给了 chunk_id 就必须同时给 doc_id")
+            exists = (
+                await db.execute(
+                    select(1).where(Chunk.id == chunk_id, Chunk.doc_id == doc_id)
+                )
+            ).first()
+            if exists is None:
+                raise ToolError(f"切片不存在：chunk {chunk_id}（doc {doc_id}）")
         if not task_id and reply_to is not None:
             # A reply belongs to the same work unit as the note it answers;
             # inheriting task_id keeps the thread on the task timeline

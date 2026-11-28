@@ -373,3 +373,45 @@ async def test_ingest_note_is_agent_readable_but_not_writable(tmp_path, monkeypa
 
         assert await ingest_note(db, "d1") is not None
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_note_rejects_dangling_chunk_and_node(tmp_path, monkeypatch):
+    """A note on a non-existent anchor is refused, not silently stored.
+
+    The old behaviour wrote the note and returned success; the reader could
+    never find it by chunk/node, so the note was lost while the writer
+    believed it had been filed.
+    """
+    import pytest as _pytest
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from app import mcp_server
+    from app.config import Settings
+    from app.models import TocNode
+
+    engine = await _seed(tmp_path)
+    Session = session_factory(engine)
+    async with Session() as db:
+        db.add(
+            TocNode(
+                doc_id="d1", node_id="d1:1", parent_id=None, level=1,
+                title="第1章", heading_path="第1章", source="bookmark", confidence=1.0,
+            )
+        )
+        await db.commit()
+    settings = Settings(
+        tocmemex_db_path=tmp_path / "tocmemex.db",
+        tocmemex_data_dir=tmp_path / "data",
+    )
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+
+    with _pytest.raises(ToolError, match="切片不存在"):
+        await mcp_server.server.call_tool(
+            "add_note", {"body": "x", "doc_id": "d1", "chunk_id": 999999}
+        )
+    with _pytest.raises(ToolError, match="节点不存在"):
+        await mcp_server.server.call_tool(
+            "add_note", {"body": "x", "doc_id": "d1", "node_id": "d1:404"}
+        )
+    await engine.dispose()
